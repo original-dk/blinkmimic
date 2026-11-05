@@ -228,6 +228,21 @@ cap for reset checks. Policy weights, world-model weights and normalizers remain
 its episode statistics, but no optimizer or probe updates run. The sampled environment count, fresh episodes
 and absent training RNG state mean this is a distribution check, not an exact reproduction of logged `sim_r`.
 
+For a native backend comparison, the same script can also run against an original mjlab checkout. In that
+checkout, use its existing environment and set `PYTHONPATH=src` so the script imports the original simulator:
+
+```bash
+PYTHONPATH=src uv run --locked python /path/to/genesis-checkout/tools/diagnose_checkpoint.py \
+  --ckpt logs/<mjlab-run>/last.pt --conditions training_dr exploration reset_noise curriculum \
+  --out logs/<mjlab-run>/training_condition_diagnostics.json
+```
+
+Replace the script path with the updated Genesis checkout's path. Keep the same checkpoint iteration, policy,
+motion files, seed, environment count and rollout length for both reports. Native mjlab uses its original
+simulator configuration and takes no `--sim_physics` flag; the report's `sim_backend` identifies the active
+backend separately from the Genesis parameter profile. This path does not require changing or retraining the
+original mjlab project. Native mjlab GPU execution must be checked on a machine with the original dependencies.
+
 For the full GPU recipe:
 
 ```bash

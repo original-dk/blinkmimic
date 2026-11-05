@@ -13,8 +13,9 @@ import torch
 
 import blinkmimic.networks as networks
 import blinkmimic.rotations as rotations
+from blinkmimic import env as simulator
 from blinkmimic.dr import XiLayout
-from blinkmimic.env import TrackingSim, checkpoint_physics, make_sim
+from blinkmimic.env import TrackingSim, make_sim
 from blinkmimic.kinematics import Kinematics
 from blinkmimic.mdp import CONTACT_Z, MAX_STEP_REWARD, MDP, unflatten_state
 from blinkmimic.motion import CONTROL_DT, MotionLib
@@ -57,6 +58,11 @@ def main():
     robot = get_robot(saved.get("robot", "g1"))
     if robot.sensing.stateful or robot.dr.push_interval_s is not None:
         parser.error("this comparison currently requires the G1 stateless sensing recipe without pushes")
+    # The script can run against the original mjlab checkout via PYTHONPATH=src, using that checkout's dependencies.
+    backend = "mjlab" if type(make_sim(robot)).__module__.startswith("mjlab.") else "genesis"
+    if backend == "mjlab" and args.sim_physics is not None:
+        parser.error("--sim_physics selects a Genesis parameter profile; omit it when running against the original mjlab checkout")
+    physics = simulator.checkpoint_physics(ck, args.sim_physics) if backend == "genesis" else None
     kin, layout = Kinematics(robot, dev), XiLayout(robot, dev)
     motion = MotionLib.from_dir(args.motion_dir or saved.get("motion_dir") or robot.motion_dir, robot, kin, dev)
     mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), layout.dim, robot.sensing)
@@ -79,8 +85,7 @@ def main():
     frames = motion.clip_start[clips] + (torch.rand(args.num_envs, generator=rng) * span).long().to(dev)
     end = motion.clip_end[clips]
     feet = [robot.tracked_bodies.index(n) for n in ("left_ankle_roll_link", "right_ankle_roll_link")]
-    physics = checkpoint_physics(ck, args.sim_physics)
-    report = {"iteration": ck["iteration"], "policy": args.policy, "sim_physics": physics,
+    report = {"iteration": ck["iteration"], "policy": args.policy, "sim_backend": backend, "sim_physics": physics,
               "training_sim_physics": saved.get("sim_physics") or "unrecorded",
               "amp": "bf16" if networks.AMP_DTYPE is not None else "none", "fused_rot": rotations.ELEMENTWISE,
               "num_envs": args.num_envs, "steps": args.steps, "seed": args.seed,
@@ -102,7 +107,8 @@ def main():
             continue
         torch.manual_seed(args.seed)
         cap = args.max_episode_steps or saved.get("max_episode_steps", 500)
-        env = TrackingSim(make_sim(robot, physics), args.num_envs, robot, motion, mdp, dev,
+        sim_cfg = make_sim(robot, physics) if backend == "genesis" else make_sim(robot)
+        env = TrackingSim(sim_cfg, args.num_envs, robot, motion, mdp, dev,
                           eval_mode=not reset_noise, randomize=dynamics, reset_noise=reset_noise,
                           max_episode_steps=cap, gamma=saved.get("gamma", 0.99),
                           fail_reset=saved.get("fail_reset", 0.0) if auto_reset else 0.0, bin_fix=saved.get("bin_fix", False))
@@ -142,6 +148,7 @@ def main():
                         torch.testing.assert_close(a, b, atol=2e-5, rtol=1e-5)
         case_config = {"dynamics_dr": dynamics, "sensing_noise": sensing, "action_noise": action_noise,
                        "reset_noise": reset_noise, "auto_reset": auto_reset, "episode_cap": env.max_episode_steps,
+                       "fail_reset": env.fail_reset, "bin_fix": env.bin_fix,
                        "initial_frames": env.f.cpu().tolist(), "initial_focus_share": env.focus_share,
                        "sampler": "saved adaptive sampler" if auto_reset else "matched reference starts"}
         torch.manual_seed(args.seed + 2)
