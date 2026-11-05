@@ -149,7 +149,7 @@ in the second. Neural updates, training resets and evaluation probes are outside
 do not establish end-to-end training speed. Rollout/state equivalence checks run before reporting results.
 Stateless G1 runs now group four 5 ms physics substeps into one Genesis scene step. Stateful sensors keep the four
 separate calls so filters still update every 5 ms. State reads and reset writes are packed, and visualization updates
-are disabled. Solver settings, PD gains and rewards are unchanged by these wrapper optimizations.
+are disabled. The wrapper optimizations preserve the selected physics profile, PD gains and rewards.
 
 For end-to-end phase attribution, use a new run directory and sample a steady-state window that includes probe
 sweeps (the main preset probes every 125 iterations). For example:
@@ -169,11 +169,32 @@ synchronization. Profiling changes scheduling, so use it to attribute costs, not
 The Genesis eager collection and synchronous probe sweeps differ from the original mjlab capture/async recipe;
 measure their contribution before changing solver parameters or learning hyperparameters.
 
-When comparing training quality with mjlab, use the same seeds, motions and evaluation protocol over multiple runs.
-Genesis currently uses its default `approximate_implicitfast` integrator and contact settings; the historical mjlab
-recipe explicitly used `implicitfast` and a `1e-6` solver tolerance. Matching the robot asset and reward alone does
-not make the dynamics equivalent. Training `sim_r` / episode statistics are also affected by adaptive resets; evaluate
-checkpoints to compare tracking quality. GPU throughput and converged returns must be measured on the target GPU.
+New training runs default to `--sim_physics mjlab`: Genesis still runs the simulation, with the original
+`implicitfast` integrator, `1e-6` solver tolerance, MuJoCo compatibility mode and a `0.02 s` default constraint time
+constant. The previous Genesis import used `0.01 s` for unspecified MJCF contact / joint-limit constraints instead
+of MuJoCo's `0.02 s`. Compatibility mode also disables contact pruning. These changes restore physics settings;
+they can increase simulation cost and do not establish a GPU throughput or convergence improvement.
+
+Use `--sim_physics genesis` to reproduce the earlier Genesis defaults. The selected profile is stored in checkpoint
+arguments. Resume and evaluation inherit it automatically; checkpoints without that field retain the earlier
+`genesis` profile. An explicit flag overrides it, so cross-profile evaluation must be intentional. Evaluation JSON
+includes checkpoint iteration and effective / recorded physics profiles; explicit overrides use separate evaluation
+filenames. Batched evaluation rejects mixed profiles unless a common override is supplied.
+
+The physics check compares four real motion states, identical joint targets, and 20 control steps in the air and on
+the ground against a MuJoCo **CPU** reference configured with the original PD drives and solver settings:
+
+```bash
+uv run --locked python tools/test_physics.py --device cpu
+# On a GPU machine, the Genesis side can be checked on CUDA too:
+uv run --locked python tools/test_physics.py --device cuda:0
+```
+
+Its report is `results/physics_comparison.json`. Short-rollout agreement does not demonstrate 3500-iteration training
+convergence or parity with mjlab / MuJoCo-Warp on a GPU. Compare full runs with equal iterations, seeds, motion data
+and evaluation protocols. Training `sim_r` / episode statistics depend on domain randomization and adaptive resets.
+Start a fresh training run to validate the corrected physics; resuming an old checkpoint without an override keeps
+its old dynamics for reproducibility.
 
 For the full GPU recipe:
 

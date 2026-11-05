@@ -26,6 +26,7 @@ import torch
 from torch import nn
 
 import blinkmimic.networks as networks
+from blinkmimic.env import checkpoint_physics
 from blinkmimic.kinematics import Kinematics
 from blinkmimic.mdp import obs_dim
 from blinkmimic.motion import CONTROL_DT, MotionLib
@@ -88,7 +89,7 @@ def main():
 
     kp, kd = pd_gains(robot)
     fmt = lambda xs: ",".join(f"{float(x):.6g}" for x in xs)  # noqa: E731
-    meta = {
+    meta = {"sim_physics": checkpoint_physics(ck),
         "run_path": os.path.abspath(a.ckpt),
         "motion": os.path.splitext(os.path.basename(a.motion))[0],
         "motion_num_frames": str(motion.num_frames),

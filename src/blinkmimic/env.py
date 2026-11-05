@@ -29,10 +29,18 @@ class SimulationCfg:
     dt: float = PHYSICS_DT
     iterations: int = 100
     batch_substeps: bool = True
+    physics: str = "mjlab"
 
 
-def make_sim(robot: RobotSpec) -> SimulationCfg:
-    return SimulationCfg()
+def make_sim(robot: RobotSpec, physics: str = "mjlab") -> SimulationCfg:
+    if physics not in ("mjlab", "genesis"):
+        raise ValueError(f"Unknown physics profile: {physics}")
+    return SimulationCfg(physics=physics)
+
+
+def checkpoint_physics(ck: dict, override: str | None = None) -> str:
+    """Earlier Genesis checkpoints used its defaults; keep their evaluation / resume dynamics."""
+    return override or ck.get("args", {}).get("sim_physics") or "genesis"
 
 
 def _bin_ema_w(stat: torch.Tensor, bins: torch.Tensor, x: torch.Tensor, wt: torch.Tensor, old: float) -> torch.Tensor:
@@ -60,6 +68,7 @@ class TrackingSim:
         delay, and pushes; ``eval_mode`` switches evaluation bookkeeping (no auto-reset, episode starts
         exactly on the reference)."""
         self.device = device
+        self.physics = sim_cfg.physics
         if not gs._initialized:
             gs.init(backend=gs.cpu if torch.device(device).type == "cpu" else gs.cuda, logging_level="warning")
         requested = torch.device(device)
@@ -68,10 +77,16 @@ class TrackingSim:
         # Stateless policies hold the same target for all four physics substeps. Let Genesis own that loop;
         # sensor filters still need a Python callback at each substep and keep the original stepping schedule.
         self.sim_substeps = DECIMATION if sim_cfg.batch_substeps and not robot.sensing.stateful else 1
+        rigid = dict(enable_self_collision=False, iterations=sim_cfg.iterations,
+                     batch_links_info=True, batch_dofs_info=True)
+        if sim_cfg.physics == "mjlab":
+            # Genesis replaces unspecified MJCF solref values with its own default (0.01 s).
+            # MuJoCo's default is 0.02 s; also restore the original integrator and solver tolerance.
+            rigid.update(integrator=gs.integrator.implicitfast, tolerance=1e-6, constraint_timeconst=0.02,
+                         enable_mujoco_compatibility=True)
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(dt=sim_cfg.dt * self.sim_substeps, substeps=self.sim_substeps),
-            rigid_options=gs.options.RigidOptions(enable_self_collision=False, iterations=sim_cfg.iterations,
-                                                 batch_links_info=True, batch_dofs_info=True),
+            rigid_options=gs.options.RigidOptions(**rigid),
             show_viewer=False,
         )
         self.ground = self.scene.add_entity(gs.morphs.Plane(), material=gs.materials.Rigid(friction=robot.dr.friction_range[0]))

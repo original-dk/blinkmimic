@@ -118,6 +118,8 @@ parser.add_argument("--device", type=str, default="cuda:0", help="torch / Genesi
 parser.add_argument("--eager", action="store_true", help="disable torch.compile for debugging and small CPU runs")
 parser.add_argument("--profile_start", type=int, default=2000, help="first zero-based iteration of the timing window")
 parser.add_argument("--profile_steps", type=int, default=0, help="opt-in synchronized phase timings; 0 disables all timing synchronization")
+parser.add_argument("--sim_physics", choices=["mjlab", "genesis"], default=None,
+                    help="physics profile: mjlab settings for new runs; resume inherits the checkpoint")
 args = parser.parse_args()
 if args.profile_start < 0 or args.profile_steps < 0:
     parser.error("--profile_start and --profile_steps must be nonnegative")
@@ -135,7 +137,7 @@ import torch.nn as nn
 
 from blinkmimic.buffer import ReplayBuffer
 from blinkmimic.dr import XiLayout
-from blinkmimic.env import PHYSICS_DT, TrackingSim, make_sim
+from blinkmimic.env import PHYSICS_DT, TrackingSim, checkpoint_physics, make_sim
 from blinkmimic.kinematics import Kinematics
 from blinkmimic.mdp import MDP, inv_dim, unflatten_state
 from blinkmimic.motion import CONTROL_DT, MotionLib
@@ -155,7 +157,6 @@ torch.manual_seed(args.seed)
 networks.AMP_DTYPE = torch.bfloat16 if args.amp == "bf16" and torch.device(args.device).type == "cuda" else None
 dev = args.device
 os.makedirs(args.log_dir, exist_ok=True)
-json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent=2)
 
 robot = get_robot(args.robot)
 J = robot.num_joints
@@ -223,6 +224,7 @@ if args.resume:
     # needs the full training state: last.pt. "pi" is the Polyak average with --pi_ema (what evaluation uses), so the
     # live policy comes from "pi_live" and the average from "pi_avg"
     ck = torch.load(args.resume, map_location=dev, weights_only=False)
+    args.sim_physics = checkpoint_physics(ck, args.sim_physics)
     assert "opt_pi" in ck, f"--resume {args.resume}: no optimizer state (use last.pt)"
     check_pruned(ck.get("args", {}), what=args.resume)
     wm.load_state_dict(ck["wm"]), pi.load_state_dict(ck.get("pi_live", ck["pi"])), critic.load_state_dict(ck["critic"])
@@ -243,6 +245,10 @@ if args.resume:
     # a warm restart either way: the replay buffer, simulator state and random streams are not saved
     del ck
 
+
+args.sim_physics = args.sim_physics or "mjlab"
+json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent=2)
+print(f"Genesis physics profile: {args.sim_physics}", flush=True)
 
 # per-component floors on the error normalization (pos, rot, lin vel, ang vel, q, qd increments)
 ERR_FLOOR = torch.cat((torch.full((3,), 3e-3), torch.full((3,), 5e-3), torch.full((3,), 2e-2), torch.full((3,), 5e-2),
@@ -529,7 +535,7 @@ def policy_update():
 
 
 # ------------------------------------------------------------------------------------------------
-sim_cfg = make_sim(robot)
+sim_cfg = make_sim(robot, args.sim_physics)
 if args.compile_more:
     # the simulator wrapper calls these once per control step in eager mode otherwise (FK + rotations: thousands of kernels)
     mdp.reward, mdp.termination, mdp.obs = compile_fn(mdp.reward), compile_fn(mdp.termination), compile_fn(mdp.obs)
@@ -586,7 +592,7 @@ if EPROBE:
                          for c in range(len(motion.names))]).to(dev)  # fmt: skip
     P_EP = len(EP_TILE)
     assert pi_avg is not None, "--eprobe_share sweeps the EMA policy: needs --pi_ema"
-    penv = TrackingSim(make_sim(robot), P_EP, robot, motion, mdp, dev, eval_mode=True, randomize=False, reset_noise=False)
+    penv = TrackingSim(sim_cfg, P_EP, robot, motion, mdp, dev, eval_mode=True, randomize=False, reset_noise=False)
     EP_FAIL = torch.zeros(motion.num_bins, device=dev)  # decayed counts of first failures per bin
     # bin b -> the next bin of the same clip (or itself at the clip end): walking it --eprobe_win times spreads a failure
     # weight back over the window before it

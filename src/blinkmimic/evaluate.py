@@ -34,6 +34,7 @@ parser.add_argument("--dr_parts", type=str, default="all", choices=["all", "dyna
 parser.add_argument("--repeats", type=int, default=1, help="rollouts per clip")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--device", type=str, default="cuda:0")
+parser.add_argument("--sim_physics", choices=["mjlab", "genesis"], default=None, help="override checkpoint physics for an explicit cross-profile evaluation")
 args = parser.parse_args()
 
 import dataclasses
@@ -43,7 +44,7 @@ import torch
 
 import blinkmimic.networks as networks
 from blinkmimic.dr import XiLayout
-from blinkmimic.env import TrackingSim, make_sim
+from blinkmimic.env import TrackingSim, checkpoint_physics, make_sim
 from blinkmimic.kinematics import Kinematics
 from blinkmimic.mdp import MAX_STEP_REWARD, MDP
 from blinkmimic.motion import MotionLib
@@ -126,6 +127,7 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
     norm_c = norm.view(args.repeats, C).mean(0)
     fail_c = env.failed_eval.view(args.repeats, C).float().mean(0)
     res = {
+        "iteration": ck["iteration"], "sim_physics": env.physics, "training_sim_physics": ck.get("args", {}).get("sim_physics") or "unrecorded",
         "norm_return": norm.mean().item(),
         "norm_return_framew": (ret.sum() / ((clip_len - 1).sum() * MAX_STEP_REWARD)).item(),
         "n_failed": int(env.failed_eval.sum().item()),
@@ -141,17 +143,28 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
     return res
 
 
-sim_cfg = make_sim(robot)
-env = TrackingSim(sim_cfg, N, robot, motion, mdp, dev, eval_mode=True, randomize=args.dr_from is not None)
+env = None
+
+
+def evaluation_env(ck):
+    global env
+    physics = checkpoint_physics(ck, args.sim_physics)
+    if env is None or env.physics != physics:
+        env = TrackingSim(make_sim(robot, physics), N, robot, motion, mdp, dev, eval_mode=True, randomize=args.dr_from is not None)
+    return env
+
+
 if args.ckpt:
     ck = torch.load(args.ckpt, map_location=dev)
-    res = evaluate(env, ck, args.record)
+    res = evaluate(evaluation_env(ck), ck, args.record)
     print(json.dumps({k: v for k, v in res.items() if k != "per_clip"}, indent=1))
     if args.record is None and (args.dr_from or args.repeats > 1):
+        physics_tag = f"_physics_{args.sim_physics}" if args.sim_physics else ""
         tag = f"dr-{args.dr_from or 'none'}{'' if args.dr_parts == 'all' else '-' + args.dr_parts}_x{args.repeats}"
-        json.dump(res, open(args.ckpt.replace(".pt", f"_eval_{tag}.json"), "w"), indent=1)
+        json.dump(res, open(args.ckpt.replace(".pt", f"_eval_{tag}{physics_tag}.json"), "w"), indent=1)
     sys.exit(0)
-out_csv = os.path.join(args.run_dir, "eval.csv")
+suffix = f"_physics_{args.sim_physics}" if args.sim_physics else ""
+out_csv = os.path.join(args.run_dir, f"eval{suffix}.csv")
 done = set()
 if os.path.exists(out_csv):
     done = {int(l.split(",")[0]) for l in open(out_csv).read().strip().splitlines()[1:]}
@@ -164,10 +177,10 @@ while True:
         it = int(os.path.basename(c)[5:11])
         ck = torch.load(c, map_location=dev)
         t0 = time.time()
-        res = evaluate(env, ck)
+        res = evaluate(evaluation_env(ck), ck)
         line = f"{it},{ck['wall_time'] / 3600:.4f},{ck['saved_at']},{time.strftime('%Y-%m-%d %H:%M:%S')},{res['norm_return']:.4f},{res['norm_return_framew']:.4f},{res['n_failed']},{'|'.join(res['failed'])}\n"
         open(out_csv, "a").write(line)
-        json.dump(res, open(c.replace(".pt", "_eval.json"), "w"), indent=1)
+        json.dump(res, open(c.replace(".pt", f"_eval{suffix}.json"), "w"), indent=1)
         print(f"[eval] it {it} ({ck['wall_time'] / 3600:.2f} h): norm return {res['norm_return']:.4f}, failed {res['n_failed']}/{C} ({time.time() - t0:.0f}s)", flush=True)
         done.add(it)
     if not args.watch:

@@ -42,6 +42,7 @@ def main():
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--reads", type=int, default=300)
     parser.add_argument("--separate_substeps", action="store_true", help="measure the original four scene.step calls")
+    parser.add_argument("--sim_physics", choices=["mjlab", "genesis"], default="mjlab")
     args = parser.parse_args()
     if min(args.num_envs, args.steps, args.reads) <= 0:
         parser.error("counts must be positive")
@@ -52,7 +53,7 @@ def main():
     motion = MotionLib.from_dir(robot.motion_dir, robot, kin, dev)
     layout = XiLayout(robot, dev)
     mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), layout.dim, robot.sensing)
-    env = TrackingSim(replace(make_sim(robot), batch_substeps=not args.separate_substeps), args.num_envs, robot, motion, mdp, dev, eval_mode=True)
+    env = TrackingSim(replace(make_sim(robot, args.sim_physics), batch_substeps=not args.separate_substeps), args.num_envs, robot, motion, mdp, dev, eval_mode=True)
     ids = torch.arange(args.num_envs, device=dev)
     clips = ids % len(motion.names)
     frames = motion.clip_start[clips] + 100
@@ -85,6 +86,7 @@ def main():
     for a, b in zip(state, legacy_state(env)):
         torch.testing.assert_close(a, b, atol=2e-5, rtol=1e-5)
     result = {"device": dev, "num_envs": args.num_envs, "steps": args.steps,
+              "sim_physics": env.physics,
               "physics_substeps_per_scene_step": env.sim_substeps,
               "scope": "eager simulator wrapper only; excludes neural updates and probe sweeps"}
     result["legacy_state_ms"] = measure(lambda: legacy_state(env), args.reads)

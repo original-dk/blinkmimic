@@ -9,6 +9,7 @@ parser.add_argument("--robot", type=str, default="g1")
 parser.add_argument("--motion_dir", type=str, default=None)
 parser.add_argument("--num_envs", type=int, default=64)
 parser.add_argument("--device", type=str, default="cuda:0")
+parser.add_argument("--sim_physics", choices=["mjlab", "genesis"], default="mjlab")
 args = parser.parse_args()
 
 import torch
@@ -28,7 +29,7 @@ t0 = time.time()
 motion = MotionLib.from_dir(args.motion_dir or robot.motion_dir, robot, kin, dev)
 print(f"motion: {len(motion.names)} clips, {motion.num_frames} frames ({motion.num_frames * 0.02 / 3600:.2f} h), bins {motion.num_bins}, load {time.time() - t0:.1f}s")
 mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)
-env = TrackingSim(make_sim(robot), args.num_envs, robot, motion, mdp, dev, eval_mode=True)
+env = TrackingSim(make_sim(robot, args.sim_physics), args.num_envs, robot, motion, mdp, dev, eval_mode=True)
 frames = motion.clip_start[torch.arange(args.num_envs, device=dev) % len(motion.names)] + 100
 env.reset(torch.arange(args.num_envs, device=dev), frames)
 env.refresh()
@@ -64,7 +65,7 @@ for t in range(150):
         print(t, "norm reward", rs[-1], "term frac", env.failed_eval.float().mean().item(), "e_body_pos", out["terms"]["e_body_pos"].mean().item())
 
 # Grouping substeps must preserve the physical rollout, not merely advance the clock faster.
-baseline = TrackingSim(replace(make_sim(robot), batch_substeps=False), args.num_envs, robot, motion, mdp, dev, eval_mode=True)
+baseline = TrackingSim(replace(make_sim(robot, args.sim_physics), batch_substeps=False), args.num_envs, robot, motion, mdp, dev, eval_mode=True)
 ids = torch.arange(args.num_envs, device=dev)
 env.reset(ids, frames)
 baseline.reset(ids, frames)

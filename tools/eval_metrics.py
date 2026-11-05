@@ -23,13 +23,14 @@ parser = argparse.ArgumentParser()
 parser.add_argument("ckpts", nargs="+")
 parser.add_argument("--robot", type=str, default="g1")
 parser.add_argument("--out", type=str, default="results/metrics")
+parser.add_argument("--sim_physics", choices=["mjlab", "genesis"], default=None)
 args = parser.parse_args()
 
 import torch
 
 import blinkmimic.networks as networks
 from blinkmimic.dr import XiLayout
-from blinkmimic.env import TrackingSim, make_sim
+from blinkmimic.env import TrackingSim, checkpoint_physics, make_sim
 from blinkmimic.kinematics import Kinematics
 from blinkmimic.mdp import MAX_STEP_REWARD, MDP
 from blinkmimic.motion import MotionLib
@@ -62,7 +63,11 @@ def load_policy(ck):
 def run(cks):
     M = len(cks)
     N = C * M
-    env = TrackingSim(make_sim(robot), N, robot, motion, mdp, dev, eval_mode=True, randomize=False)
+    profiles = {checkpoint_physics(ck, args.sim_physics) for ck in cks}
+    if len(profiles) != 1:
+        raise ValueError("Cannot batch different physics profiles; select a common --sim_physics explicitly")
+    physics = profiles.pop()
+    env = TrackingSim(make_sim(robot, physics), N, robot, motion, mdp, dev, eval_mode=True, randomize=False)
     pis = [load_policy(ck) for ck in cks]
     K, Hh = cks[0]["args"]["goal_frames"], cks[0]["args"]["hist"]
     networks.AMP_DTYPE = torch.bfloat16 if cks[0]["args"].get("amp", "none") == "bf16" else None
@@ -108,6 +113,7 @@ def run(cks):
         s = {k: v[m * C : (m + 1) * C].sum().item() for k, v in acc.items()}
         n = s["n"]
         res.append({
+            "sim_physics": physics, "training_sim_physics": cks[m].get("args", {}).get("sim_physics") or "unrecorded",
             "norm_return": (acc["ret"][m * C : (m + 1) * C] / ((clip_len[m * C : (m + 1) * C] - 1).float() * MAX_STEP_REWARD)).mean().item(),
             "n_failed": int(env.failed_eval[m * C : (m + 1) * C].sum().item()),
             "body_pos_cm": 100 * (s["pos"] / n) ** 0.5,

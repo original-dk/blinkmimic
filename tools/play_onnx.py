@@ -38,6 +38,7 @@ def main():
     ap.add_argument("onnx")
     ap.add_argument("--robot", type=str, default="g1")
     ap.add_argument("--motion", type=str, required=True, help="the motion baked into the ONNX")
+    ap.add_argument("--sim_physics", choices=["mjlab", "genesis"], default=None)
     a = ap.parse_args()
 
     sess = ort.InferenceSession(a.onnx, providers=["CPUExecutionProvider"])
@@ -51,7 +52,7 @@ def main():
     kin = Kinematics(robot, dev)
     motion = MotionLib([a.motion], kin, dev, robot.load_motion)
     mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)
-    env = TrackingSim(make_sim(robot), 1, robot, motion, mdp, dev, eval_mode=True)
+    env = TrackingSim(make_sim(robot, a.sim_physics or meta.get("sim_physics", "genesis")), 1, robot, motion, mdp, dev, eval_mode=True)
     env.done_eval[:] = False
     env.failed_eval[:] = False
     env.reset(torch.arange(1, device=dev), motion.clip_start.clone())

@@ -20,13 +20,14 @@ parser.add_argument("--group", type=int, default=13, help="checkpoints evaluated
 parser.add_argument("--reps", type=int, default=1,
                     help="independent replicas of every clip per checkpoint (the simulator is not bitwise "
                          "reproducible, so borderline clips can flip); results are averaged and written to eval_r<reps>.csv")
+parser.add_argument("--sim_physics", choices=["mjlab", "genesis"], default=None, help="override checkpoint physics for an explicit cross-profile evaluation")
 args = parser.parse_args()
 
 import torch
 
 import blinkmimic.networks as networks
 from blinkmimic.dr import XiLayout
-from blinkmimic.env import TrackingSim, make_sim
+from blinkmimic.env import TrackingSim, checkpoint_physics, make_sim
 from blinkmimic.kinematics import Kinematics
 from blinkmimic.mdp import MAX_STEP_REWARD, MDP
 from blinkmimic.motion import MotionLib
@@ -117,7 +118,7 @@ def merge_reps(res: list[dict]) -> list[dict]:
     return out
 
 
-SUFFIX = "" if args.reps == 1 else f"_r{args.reps}"
+SUFFIX = ("" if args.reps == 1 else f"_r{args.reps}") + (f"_physics_{args.sim_physics}" if args.sim_physics else "")
 out_csv = os.path.join(args.run_dir, f"eval{SUFFIX}.csv")
 done = set()
 if os.path.exists(out_csv):
@@ -133,14 +134,19 @@ env = None
 for s in range(0, len(todo), args.group):
     paths = todo[s : s + args.group]
     cks = [torch.load(p, map_location="cpu", weights_only=False) for p in paths]  # full checkpoints also hold the world model: keep them off the GPU
-    if env is None or env.N != C * len(paths) * args.reps:
-        env = TrackingSim(make_sim(robot), C * len(paths) * args.reps, robot, motion, mdp, dev, eval_mode=True, randomize=False)
+    profiles = {checkpoint_physics(ck, args.sim_physics) for ck in cks}
+    if len(profiles) != 1:
+        raise ValueError("Cannot batch different physics profiles; select a common --sim_physics explicitly")
+    physics = profiles.pop()
+    if env is None or env.N != C * len(paths) * args.reps or env.physics != physics:
+        env = TrackingSim(make_sim(robot, physics), C * len(paths) * args.reps, robot, motion, mdp, dev, eval_mode=True, randomize=False)
     t0 = time.time()
     for p, ck, res in zip(paths, cks, merge_reps(evaluate_group(env, [c for c in cks for _ in range(args.reps)]))):
         it = int(os.path.basename(p)[5:11])
         # 6 decimals: the 0.82 threshold is applied to these values
         line = (f"{it},{ck['wall_time'] / 3600:.6f},{ck['saved_at']},{time.strftime('%Y-%m-%d %H:%M:%S')},{res['norm_return']:.6f},"
                 f"{res['norm_return_framew']:.6f},{res['n_failed']:g},{'|'.join(res['failed'])}\n")  # fmt: skip
+        res["sim_physics"], res["training_sim_physics"] = physics, ck.get("args", {}).get("sim_physics") or "unrecorded"
         res["layout"] = {"n_worlds": env.N, "group": [int(os.path.basename(q)[5:11]) for q in paths], "reps": args.reps,
                          "motion": MOTION_ID}  # fmt: skip
         open(out_csv, "a").write(line)
