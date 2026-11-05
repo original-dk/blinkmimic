@@ -1,7 +1,8 @@
-"""Controlled checkpoint rollouts with sensing noise and dynamics / encoder-offset DR isolated.
+"""Controlled checkpoint rollouts isolating DR, exploration and reset conditions.
 
-Uses the same reference starts in four conditions. This is a diagnostic sample, not the full-clip evaluation
-protocol or the adaptive-reset training distribution. No optimizer updates or simulator parameters are changed.
+The default four conditions use matched reference starts. Optional conditions add training exploration,
+reset perturbations and the saved adaptive sampler. Weights and normalizers stay frozen; these samples
+are diagnostic comparisons rather than the full-clip evaluation or an exact replay of training.
 """
 
 import argparse
@@ -15,7 +16,7 @@ import blinkmimic.rotations as rotations
 from blinkmimic.dr import XiLayout
 from blinkmimic.env import TrackingSim, checkpoint_physics, make_sim
 from blinkmimic.kinematics import Kinematics
-from blinkmimic.mdp import CONTACT_Z, MAX_STEP_REWARD, MDP
+from blinkmimic.mdp import CONTACT_Z, MAX_STEP_REWARD, MDP, unflatten_state
 from blinkmimic.motion import CONTROL_DT, MotionLib
 from blinkmimic.networks import Policy, WorldModel, policy_kwargs
 from blinkmimic.robot import get_robot
@@ -34,9 +35,16 @@ def main():
     parser.add_argument("--motion_dir", default=None)
     parser.add_argument("--sim_physics", choices=["mjlab", "genesis"], default=None)
     parser.add_argument("--out", default=None)
+    parser.add_argument("--conditions", nargs="+", choices=["clean", "sensing_only", "dynamics_only", "training_dr",
+                                                           "exploration", "reset_noise", "curriculum"],
+                        default=["clean", "sensing_only", "dynamics_only", "training_dr"])
+    parser.add_argument("--max_episode_steps", type=int, default=None,
+                        help="override the curriculum rollout episode cap; default is the training cap")
     args = parser.parse_args()
     if min(args.num_envs, args.steps) <= 0:
         parser.error("--num_envs and --steps must be positive")
+    if args.max_episode_steps is not None and args.max_episode_steps <= 0:
+        parser.error("--max_episode_steps must be positive")
     dev = args.device
     ck = torch.load(args.ckpt, map_location=dev, weights_only=False)
     saved = ck["args"]
@@ -76,54 +84,99 @@ def main():
               "training_sim_physics": saved.get("sim_physics") or "unrecorded",
               "amp": "bf16" if networks.AMP_DTYPE is not None else "none", "fused_rot": rotations.ELEMENTWISE,
               "num_envs": args.num_envs, "steps": args.steps, "seed": args.seed,
-              "scope": "matched reference starts, deterministic actions, no reset noise, no training updates",
+              "scope": "frozen checkpoint; controlled noise / sampler conditions, no training updates",
               "dynamics_dr_includes_encoder_offsets": True,
-              "observation_history": H, "exploration_noise": 0.0, "reset_noise": False,
+              "observation_history": H,
               "starts": [{"clip": motion.names[int(c)], "frame": int(f)} for c, f in zip(clips.cpu(), frames.cpu())],
               "conditions": {}}
+    configs = (("clean", False, False, 0.0, False, False),
+               ("sensing_only", False, True, 0.0, False, False),
+               ("dynamics_only", True, False, 0.0, False, False),
+               ("training_dr", True, True, 0.0, False, False),
+               ("exploration", True, True, saved.get("action_noise", 0.1), False, False),
+               ("reset_noise", True, True, saved.get("action_noise", 0.1), True, False),
+               ("curriculum", True, True, saved.get("action_noise", 0.1), True, True))
     initial, initial_xi = None, {}
-    for name, dynamics, sensing in (("clean", False, False), ("sensing_only", False, True),
-                                    ("dynamics_only", True, False), ("training_dr", True, True)):
+    for name, dynamics, sensing, action_noise, reset_noise, auto_reset in configs:
+        if name not in args.conditions:
+            continue
         torch.manual_seed(args.seed)
-        env = TrackingSim(make_sim(robot, physics), args.num_envs, robot, motion, mdp, dev, eval_mode=True, randomize=dynamics)
-        # Keep dynamics / encoder offsets fixed while independently toggling the observation-noise branch.
+        cap = args.max_episode_steps or saved.get("max_episode_steps", 500)
+        env = TrackingSim(make_sim(robot, physics), args.num_envs, robot, motion, mdp, dev,
+                          eval_mode=not reset_noise, randomize=dynamics, reset_noise=reset_noise,
+                          max_episode_steps=cap, gamma=saved.get("gamma", 0.99),
+                          fail_reset=saved.get("fail_reset", 0.0) if auto_reset else 0.0, bin_fix=saved.get("bin_fix", False))
+        # Evaluation bookkeeping can be used with a perturbed initial state; only the curriculum condition auto-resets.
+        env.eval_mode = not auto_reset
+        if not auto_reset:
+            env.max_episode_steps = 10**9
         env.randomize = sensing
+        if auto_reset:
+            ctrl = ck.get("ctrl") or {}
+            bins = ctrl.get("env_bins")
+            if bins is None:
+                parser.error("curriculum requires a full last.pt with ctrl.env_bins")
+            for key in ("bin_G", "bin_fail", "bin_w_avg"):
+                source = bins[key].to(dev)
+                if source.shape != getattr(env, key).shape:
+                    parser.error("saved curriculum does not match the selected motion data")
+                getattr(env, key).copy_(source)
+            if ctrl.get("focus_q") is not None:
+                env.set_focus(ctrl["focus_q"].to(dev), float(ctrl["focus_share"]))
         torch.manual_seed(args.seed + 1)
-        env.reset(ids, frames)
-        state = tuple(x.clone() for x in env.state())
-        if initial is None:
-            initial = state
-        else:
-            for a, b in zip(initial, state):
-                torch.testing.assert_close(a, b, atol=2e-5, rtol=1e-5)
-        if dynamics in initial_xi:
-            torch.testing.assert_close(env.xi, initial_xi[dynamics], atol=0, rtol=0)
-        else:
-            initial_xi[dynamics] = env.xi.clone()
-        torch.manual_seed(args.seed + 2)  # paired observation-noise draws, independent of DR reset draws
+        env.reset(ids, None if auto_reset else frames)
+        if not auto_reset:
+            if dynamics in initial_xi:
+                # Keep encoder offsets paired when reset-pose noise consumes additional random draws.
+                sl = layout.slices["joint_offset"]
+                env.xi[:, sl] = initial_xi[dynamics][:, sl]
+                torch.testing.assert_close(env.xi, initial_xi[dynamics], atol=0, rtol=0)
+            else:
+                initial_xi[dynamics] = env.xi.clone()
+            if not reset_noise:
+                state = tuple(x.clone() for x in env.state())
+                if initial is None:
+                    initial = state
+                else:
+                    for a, b in zip(initial, state):
+                        torch.testing.assert_close(a, b, atol=2e-5, rtol=1e-5)
+        case_config = {"dynamics_dr": dynamics, "sensing_noise": sensing, "action_noise": action_noise,
+                       "reset_noise": reset_noise, "auto_reset": auto_reset, "episode_cap": env.max_episode_steps,
+                       "initial_frames": env.f.cpu().tolist(), "initial_focus_share": env.focus_share,
+                       "sampler": "saved adaptive sampler" if auto_reset else "matched reference starts"}
+        torch.manual_seed(args.seed + 2)
         sums = dict.fromkeys(("return", "track", "action_rate", "joint_limit", "body_pos", "body_ori"), 0.0)
         errors = {group: dict.fromkeys(("p_m", "rot_rad", "v_m_s", "w_rad_s", "q_rad", "qd_rad_s"), 0.0)
                   for group in ("all", "contact", "no_contact")}
         counts = dict.fromkeys(errors, 0)
         hist = None
         settled_return, settled_count = 0.0, 0
-        for step in range(args.steps):
-            alive = ~env.done_eval.clone()
+        episode_ends, terminations = 0, 0
+        for _ in range(args.steps):
+            alive = torch.ones_like(env.done_eval) if auto_reset else ~env.done_eval.clone()
             S = env.state()
             o = env.observe()
-            hist = o[:, None].expand(-1, H, -1).clone() if hist is None else torch.cat((hist[:, 1:], o[:, None]), 1)
+            repeated = o[:, None].expand(-1, H, -1)
+            hist = repeated.clone() if hist is None else torch.where((env.ep_step == 0)[:, None, None], repeated,
+                                                                   torch.cat((hist[:, 1:], o[:, None]), 1))
             a = pi(hist, motion.goal(env.f, K))
+            if action_noise:
+                a = torch.clamp(a + action_noise * torch.randn_like(a), -20, 20)
+            fresh = env.ep_step < H
             predicted = wm.step(S, a, env.a_prev, layout.normalize(env.xi))
             out = env.step(a)
-            actual = env.state()
+            # step() may already have reset ended episodes. Score the transition's pre-reset s1, as the replay buffer does.
+            actual = unflatten_state(out["s1"])
+            episode_ends += int((out["done"] & alive).sum())
+            terminations += int((out["term"] & alive).sum())
             assert torch.isfinite(out["r"][alive]).all(), name
             terms = out["terms"]
             vals = {"return": out["r"] / MAX_STEP_REWARD, "track": terms["track"] / MAX_STEP_REWARD,
                     "action_rate": terms["action_rate"], "joint_limit": terms["joint_limit"],
                     "body_pos": terms["e_body_pos"], "body_ori": terms["e_body_ori"]}
-            if step >= H:
-                settled_return += torch.where(alive, vals["return"], 0.0).sum().item()
-                settled_count += int(alive.sum())
+            settled = alive & ~fresh
+            settled_return += torch.where(settled, vals["return"], 0.0).sum().item()
+            settled_count += int(settled.sum())
             for k, value in vals.items():
                 sums[k] += torch.where(alive, value, 0.0).sum().item()
             body_p = kin.forward(*actual)[0]
@@ -136,11 +189,14 @@ def main():
                     assert torch.isfinite(residual[mask]).all(), (name, group, k)
                     mse = residual.square().mean(-1)
                     errors[group][k] += torch.where(mask, mse, 0.0).sum().item()
-            env.f = torch.minimum(env.f, end - 1)
-            if bool(env.done_eval.all()):
+            if not auto_reset:
+                env.f = torch.minimum(env.f, end - 1)
+            if not auto_reset and bool(env.done_eval.all()):
                 break
         n = counts["all"]
-        result = {"transitions": n, "n_failed": int(env.failed_eval.sum()),
+        result = {"config": case_config, "transitions": n, "n_failed": None if auto_reset else int(env.failed_eval.sum()),
+                  "episode_ends": episode_ends, "episode_terminations": terminations,
+                  "term_fraction": terminations / episode_ends if episode_ends else None,
                   "mean_step_return": sums["return"] / n,
                   "settled_step_return": settled_return / settled_count if settled_count else None,
                   "settled_transitions": settled_count, "tracking_contribution": sums["track"] / n,
@@ -155,12 +211,12 @@ def main():
         report["conditions"][name] = result
         print(f"{name}: return {result['mean_step_return']:.4f} | track {result['tracking_contribution']:.4f} "
               f"rate {result['action_rate_contribution']:.4f} limit {result['joint_limit_contribution']:.4f} "
-              f"| failed {result['n_failed']}/{args.num_envs} | WM v {result['wm_one_step_rmse']['all']['v_m_s']:.4f} "
+              f"| terminations {terminations}/{episode_ends} | WM v {result['wm_one_step_rmse']['all']['v_m_s']:.4f} "
               f"qd {result['wm_one_step_rmse']['all']['qd_rad_s']:.4f}", flush=True)
     path = Path(args.out) if args.out else Path(args.ckpt).with_name("checkpoint_diagnostics.json")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(report, indent=2) + "\n")
-    print(f"[PASS] matched starts / dynamics and reward decomposition; report: {path}")
+    print(f"[PASS] selected condition controls, pre-reset transition scoring and reward decomposition; report: {path}")
 
 
 if __name__ == "__main__":

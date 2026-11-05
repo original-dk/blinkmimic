@@ -211,6 +211,23 @@ checkpoint; `--policy ema` selects the deployed policy instead. The report inclu
 physics profile. The short sampled starts are different from both full-clip evaluation and adaptive training resets,
 so these returns are diagnostic comparisons, not replacements for `norm_return` or training `sim_r`.
 
+To isolate conditions missing from the default comparison, use the same checkpoint with:
+
+```bash
+uv run --locked python tools/diagnose_checkpoint.py --ckpt logs/<run>/last.pt \
+  --conditions training_dr exploration reset_noise curriculum \
+  --out logs/<run>/training_condition_diagnostics.json
+```
+
+`exploration` adds the checkpoint's training action noise to `training_dr`; `reset_noise` also perturbs the
+initial pose and velocities. These conditions keep the matched reference starts and paired DR parameters.
+`curriculum` adds adaptive sampling, restoring the checkpoint's bin statistics and probe focus, and auto-resets
+episodes with the saved training cap. Its report counts episode ends and terminations separately and scores
+world-model predictions against pre-reset transitions. `--max_episode_steps` overrides this condition's episode
+cap for reset checks. Policy weights, world-model weights and normalizers remain frozen; the sampler updates
+its episode statistics, but no optimizer or probe updates run. The sampled environment count, fresh episodes
+and absent training RNG state mean this is a distribution check, not an exact reproduction of logged `sim_r`.
+
 For the full GPU recipe:
 
 ```bash
