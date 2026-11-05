@@ -196,6 +196,21 @@ and evaluation protocols. Training `sim_r` / episode statistics depend on domain
 Start a fresh training run to validate the corrected physics; resuming an old checkpoint without an override keeps
 its old dynamics for reproducibility.
 
+To inspect an existing full checkpoint without retraining, run:
+
+```bash
+uv run --locked python tools/diagnose_checkpoint.py --ckpt logs/<run>/last.pt
+```
+
+The tool compares the live policy (the one used for training collection) from the same sampled reference starts in
+four conditions: clean, observation noise only, dynamics / encoder-offset DR only, and both. It uses deterministic
+actions with no exploration or reset noise. It verifies matched initial states and paired DR parameters, splits
+normalized reward into tracking, action-rate and joint-limit contributions, and measures world-model one-step
+errors separately for foot-contact and non-contact transitions. `checkpoint_diagnostics.json` is written beside the
+checkpoint; `--policy ema` selects the deployed policy instead. The report includes the checkpoint iteration and
+physics profile. The short sampled starts are different from both full-clip evaluation and adaptive training resets,
+so these returns are diagnostic comparisons, not replacements for `norm_return` or training `sim_r`.
+
 For the full GPU recipe:
 
 ```bash
