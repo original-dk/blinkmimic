@@ -1,6 +1,6 @@
 """Check that state() reflects a reset immediately (no stale data)."""
 import argparse
-parser = argparse.ArgumentParser(); parser.add_argument("--robot", type=str, default="g1"); args = parser.parse_args()
+parser = argparse.ArgumentParser(); parser.add_argument("--robot", type=str, default="g1"); parser.add_argument("--device", type=str, default="cuda:0"); args = parser.parse_args()
 import torch
 from blinkmimic.dr import XiLayout
 from blinkmimic.env import TrackingSim, make_sim
@@ -8,7 +8,7 @@ from blinkmimic.kinematics import Kinematics
 from blinkmimic.mdp import MDP, unflatten_state
 from blinkmimic.motion import MotionLib
 from blinkmimic.robot import get_robot
-dev = "cuda:0"
+dev = args.device
 robot = get_robot(args.robot)
 kin = Kinematics(robot, dev); motion = MotionLib.from_dir(robot.motion_dir, robot, kin, dev)
 mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)

@@ -20,7 +20,6 @@ Usage: python tools/export_onnx.py --robot g1 --ckpt logs/<run>/ckpt_003500.pt \
 
 import argparse
 import os
-import re
 
 import onnx
 import torch
@@ -59,12 +58,7 @@ class PolicyWithMotion(nn.Module):
 
 
 def pd_gains(robot: RobotSpec) -> tuple[list[float], list[float]]:
-    acts = robot.robot_cfg().articulation.actuators
-    kp, kd = [], []
-    for n in robot.joint_names:
-        act = next(a for a in acts if any(re.fullmatch(p, n) for p in a.target_names_expr))
-        kp.append(act.stiffness), kd.append(act.damping)
-    return kp, kd
+    return [d.stiffness for d in robot.drives], [d.damping for d in robot.drives]
 
 
 def main():

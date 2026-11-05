@@ -90,26 +90,11 @@ parser.add_argument("--eprobe_every", type=int, default=250)
 parser.add_argument("--eprobe_start", type=int, default=1250, help="first sweep (before it, nearly every probe fails and the focus is ~uniform)")
 parser.add_argument("--eprobe_win", type=int, default=10, help="bins (1 s each) before a failure that receive the focus resets")
 parser.add_argument("--eprobe_decay", type=float, default=0.5, help="per-sweep decay of the failure counts")
-parser.add_argument("--eprobe_graph", action="store_true",
-                    help="engineering: one sweep step (observation, policy, simulator step incl. MuJoCo Warp's solver loop, "
-                         "bookkeeping) is replayed as a CUDA graph, without the per-step host check for all probes done "
-                         "(the sweep always runs lead + tile steps, which every probe needs at most). Same computation; the "
-                         "simulator is not bitwise reproducible either way")
-parser.add_argument("--eprobe_async", type=int, default=0,
-                    help="with --eprobe_graph: run each sweep on a side CUDA stream alongside training, this many sweep steps "
-                         "launched per iteration, with a snapshot of the EMA policy taken when the sweep starts; its failures "
-                         "update the focus distribution once the last step has run (ceil(steps / this) + 1 iterations later "
-                         "instead of at once). 0 = off")
-# ---- systems (wall-clock only; the same updates up to floating-point rounding) ----
-parser.add_argument("--collect_graph", action="store_true",
-                    help="engineering, with --graph_early: one collection step up to the episode ends (observation, policy "
-                         "and action noise, simulator step incl. MuJoCo Warp's solver loop, reward, buffer write, normalizer "
-                         "updates) is replayed as a CUDA graph; bin statistics and resets of ended episodes stay eager. Same "
-                         "computation, different random stream")
-parser.add_argument("--reset_masked", action="store_true",
-                    help="engineering, with --collect_graph: the episode ends too (bin statistics, resets) as fixed-size masked "
-                         "updates inside the collection graph, so a collection step has no host sync; the reset worlds get "
-                         "the same values as with ids, random draws are made for all worlds")
+# Old simulator-capture flags fail explicitly instead of silently selecting another backend.
+parser.add_argument("--eprobe_graph", action="store_true", help="unsupported with Genesis; use eager probe sweeps")
+parser.add_argument("--eprobe_async", type=int, default=0, help="unsupported with Genesis; use synchronous probe sweeps")
+parser.add_argument("--collect_graph", action="store_true", help="unsupported with Genesis; use eager collection")
+parser.add_argument("--reset_masked", action="store_true", help="unsupported simulator-graph optimization")
 parser.add_argument("--graph_early", action="store_true",
                     help="engineering, with --cuda_graph: the replay buffer keeps its fill level on the device and the updates "
                          "are captured at once instead of after the buffer is full (~375 iterations at --utd 0.4). Sampling "
@@ -129,7 +114,15 @@ parser.add_argument("--log_dir", type=str, default=os.path.join(REPO, "logs", "r
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--resume", type=str, default=None)
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
+parser.add_argument("--device", type=str, default="cuda:0", help="torch / Genesis device (cpu for small smoke runs)")
+parser.add_argument("--eager", action="store_true", help="disable torch.compile for debugging and small CPU runs")
 args = parser.parse_args()
+if args.collect_graph or args.eprobe_graph or args.eprobe_async:
+    parser.error("Genesis collection / evaluation uses eager stepping; omit --collect_graph, --eprobe_graph and --eprobe_async")
+if args.reset_masked:
+    parser.error("--reset_masked requires the unsupported simulator collection graph; use eager resets")
+if args.device == "cpu" and (args.cuda_graph or args.graph_early):
+    parser.error("--cuda_graph and --graph_early require a CUDA device")
 
 import torch
 import torch.nn as nn
@@ -152,8 +145,8 @@ from blinkmimic.sensing import ObsPipeline
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.manual_seed(args.seed)
-networks.AMP_DTYPE = torch.bfloat16 if args.amp == "bf16" else None
-dev = "cuda:0"
+networks.AMP_DTYPE = torch.bfloat16 if args.amp == "bf16" and torch.device(args.device).type == "cuda" else None
+dev = args.device
 os.makedirs(args.log_dir, exist_ok=True)
 json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent=2)
 
@@ -320,15 +313,16 @@ def _critic_input(S, f, xi_n, g):
     return torch.cat((mdp.critic_features(S, f, xi_n), g), -1)
 
 
-wm_rollout = torch.compile(_wm_rollout)
-wm_err = torch.compile(_wm_err)
-imag_step = torch.compile(_imag_step)
-imag_step_sensed = torch.compile(_imag_step_sensed)
-reward_term = torch.compile(_reward_term)
-critic_input_c = torch.compile(_critic_input)
-wm_norm_data_c = torch.compile(_wm_norm_data)
-gae_targets_c = torch.compile(_gae_targets)
-critic_loss_c = torch.compile(_critic_loss)
+compile_fn = (lambda fn: fn) if args.eager else torch.compile
+wm_rollout = compile_fn(_wm_rollout)
+wm_err = compile_fn(_wm_err)
+imag_step = compile_fn(_imag_step)
+imag_step_sensed = compile_fn(_imag_step_sensed)
+reward_term = compile_fn(_reward_term)
+critic_input_c = compile_fn(_critic_input)
+wm_norm_data_c = compile_fn(_wm_norm_data)
+gae_targets_c = compile_fn(_gae_targets)
+critic_loss_c = compile_fn(_critic_loss)
 
 
 def lr_at(it: int) -> float:
@@ -531,8 +525,8 @@ def policy_update():
 sim_cfg = make_sim(robot)
 if args.compile_more:
     # the simulator wrapper calls these once per control step in eager mode otherwise (FK + rotations: thousands of kernels)
-    mdp.reward, mdp.termination, mdp.obs = torch.compile(mdp.reward), torch.compile(mdp.termination), torch.compile(mdp.obs)
-    motion.goal = torch.compile(motion.goal)
+    mdp.reward, mdp.termination, mdp.obs = compile_fn(mdp.reward), compile_fn(mdp.termination), compile_fn(mdp.obs)
+    motion.goal = compile_fn(motion.goal)
 env = TrackingSim(sim_cfg, args.num_envs, robot, motion, mdp, dev, gamma=args.gamma, fail_reset=args.fail_reset, bin_fix=args.bin_fix)
 if INIT_BINS is not None:  # --resume: the checkpoint's reset-sampler statistics (episodes already running keep their start)
     env.bin_G.copy_(INIT_BINS["bin_G"]), env.bin_fail.copy_(INIT_BINS["bin_fail"]), env.bin_w_avg.copy_(INIT_BINS["bin_w_avg"])
@@ -541,103 +535,9 @@ buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev, J, layout.dim,
 obs_hist = torch.zeros(args.num_envs, Hh, mdp.obs_dim, device=dev)
 
 
-CG = {"calls": 0}  # --collect_graph: static tensors and the graph
-
-
-@torch.no_grad()
-def _collect_core():
-    """One collection step up to the episode ends, on the static tensors of CG (the --collect_graph body)."""
-    o = env.observe()
-    fresh = env.ep_step == 0
-    oh = CG["obs_hist"]
-    oh_new = torch.where(fresh[:, None, None], o.unsqueeze(1).expand_as(oh), torch.cat((oh[:, 1:], o.unsqueeze(1)), 1))
-    g = motion.goal(env.f, K)
-    pi.obs_norm.update(o)
-    pi.goal_norm.update(g)
-    a = pi(oh_new, g)
-    a = torch.clamp(a + args.action_noise * torch.randn_like(a), -20, 20)
-    out = env.step_core(a)
-    buffer.add_device(out)
-    S0, S1 = unflatten_state(out["s"]), unflatten_state(out["s1"])
-    wm_in, wm_out, wm_inc = (wm_norm_data_c if args.compile_more else _wm_norm_data)(S0, S1, out["a"], out["a_prev"], out["xi"])
-    wm.in_norm.update(wm_in)
-    wm.out_norm.update(wm_out)
-    wm.inc_norm.update(wm_inc)
-    oh.copy_(oh_new)
-    # the simulator wrapper rebinds these per step: copy them back into the static tensors the graph reads
-    CG["f"].copy_(env.f), CG["ep_step"].copy_(env.ep_step), CG["a_prev"].copy_(env.a_prev)
-    env.f, env.ep_step, env.a_prev = CG["f"], CG["ep_step"], CG["a_prev"]
-    core = {"done": out["done"], "term": out["term"], "f": out["f"], "r_mean": out["r"].mean() / 0.1}
-    if args.reset_masked:  # the episode ends in the graph too (reset_masked writes f, ep_step, a_prev in place)
-        out = env.step_tail_masked(out)
-        n = out["n_done"]
-        nan = torch.full((), float("nan"), device=dev)
-        core.update(ep_len=torch.where(n > 0, out["ep_len_sum"] / n.clamp(min=1), nan),
-                    ep_ret=torch.where(n > 0, out["ep_ret_norm_sum"] / n.clamp(min=1), nan),
-                    term_sum=out["term"].float().sum(), done_sum=n)  # fmt: skip
-    return core
-
-
-@torch.no_grad()
-def collect_graphed_step():
-    import warp as wp
-    from mjlab.sim.sim_data import TorchArray
-
-    global obs_hist
-    if CG["calls"] == 0:
-        CG.update(obs_hist=obs_hist.clone(), f=env.f.clone(), ep_step=env.ep_step.clone(), a_prev=env.a_prev.clone())
-        env.f, env.ep_step, env.a_prev = CG["f"], CG["ep_step"], CG["a_prev"]
-    CG["calls"] += 1
-    if CG["calls"] <= 3:  # warmup on the default stream (Warp's own stream orders with it implicitly)
-        out = _collect_core()
-    elif "graph" not in CG:
-        torch.cuda.synchronize()
-        t0 = time.time()
-        CG["graph"] = torch.cuda.CUDAGraph()
-        setitem, env.sim.use_cuda_graph = TorchArray.__setitem__, False  # as eprobe_sweep_graphed
-        TorchArray.__setitem__ = lambda self, idx, value: self._tensor.__setitem__(idx, value)
-        try:
-            with torch.cuda.graph(CG["graph"], capture_error_mode="thread_local"):
-                ws = wp.stream_from_torch(torch.cuda.current_stream())
-                with wp.ScopedStream(ws, sync_enter=False, sync_exit=False):
-                    wp.capture_begin(stream=ws, external=True)
-                    try:
-                        CG["out"] = _collect_core()
-                    finally:
-                        CG["wp_graph"] = wp.capture_end(stream=ws)  # keep: it holds the captured kernels' modules
-        finally:
-            TorchArray.__setitem__, env.sim.use_cuda_graph = setitem, True
-        torch.cuda.synchronize()
-        print(f"--collect_graph: captured one collection step in {time.time() - t0:.1f} s", flush=True)
-        CG["graph"].replay()  # the capture itself does not run the step
-        out = CG["out"]
-    else:
-        CG["graph"].replay()
-        out = CG["out"]
-    buffer.advance_host()
-    obs_hist = CG["obs_hist"]
-    return out
-
-
 @torch.no_grad()
 def collect(n_steps: int, stats: dict):
     global obs_hist, sim_steps
-    if args.collect_graph:
-        for _ in range(n_steps):
-            core = collect_graphed_step()
-            sim_steps += args.num_envs
-            stats["r"].append(core["r_mean"].clone())
-            if args.reset_masked:  # every step appends; steps without an ended episode carry NaN means (skipped in the log)
-                for k_s, k_c in (("ep_len", "ep_len"), ("ep_ret", "ep_ret"), ("term", "term_sum"), ("done", "done_sum")):
-                    stats[k_s].append(core[k_c].clone())
-                continue
-            out = env.step_tail({"done": core["done"], "term": core["term"], "f": core["f"]})
-            if "ep_len" in out:
-                stats["ep_len"].append(out["ep_len"].mean())
-                stats["ep_ret"].append(out["ep_ret_norm"].mean())
-                stats["term"].append(core["term"].float().sum())
-                stats["done"].append(core["done"].float().sum())
-        return
     for _ in range(n_steps):
         o = env.observe()
         fresh = env.ep_step == 0
@@ -663,11 +563,6 @@ def collect(n_steps: int, stats: dict):
             stats["done"].append(out["done"].float().sum())
 
 if GRAPH:
-    assert not args.reset_masked or args.collect_graph, "--reset_masked needs --collect_graph"
-    if args.reset_masked:
-        env.use_static_focus()
-    assert not args.collect_graph or (args.graph_early and not env.push_enabled and not pipe.stateful), \
-        "--collect_graph: needs --graph_early; no pushes, sensing state"
     buffer.use_device_ptr(device_size=args.graph_early)
     # captured sampling has static bounds (buffer.size): capture once the buffer is full (--graph_early: device-side
     # bounds, capture at once)
@@ -684,9 +579,6 @@ if EPROBE:
                          for c in range(len(motion.names))]).to(dev)  # fmt: skip
     P_EP = len(EP_TILE)
     assert pi_avg is not None, "--eprobe_share sweeps the EMA policy: needs --pi_ema"
-    assert not args.eprobe_async or args.eprobe_graph, "--eprobe_async needs --eprobe_graph"
-    EP_PI = copy.deepcopy(pi_avg.module) if args.eprobe_async else pi_avg.module  # sweep policy (async: a snapshot)
-    EP_SIDE, EP_ASYNC, ITER_NOW = (torch.cuda.Stream() if args.eprobe_async else None), {}, [0]
     penv = TrackingSim(make_sim(robot), P_EP, robot, motion, mdp, dev, eval_mode=True, randomize=False, reset_noise=False)
     EP_FAIL = torch.zeros(motion.num_bins, device=dev)  # decayed counts of first failures per bin
     # bin b -> the next bin of the same clip (or itself at the clip end): walking it --eprobe_win times spreads a failure
@@ -715,79 +607,6 @@ def eprobe_sweep_eager(n_steps, stop, fcap):
     return fail_f
 
 
-EPG = {}  # --eprobe_graph: static tensors and the graph
-
-
-def _eprobe_step():
-    o = penv.observe()
-    h = torch.cat((EPG["hist"][:, 1:], o.unsqueeze(1)), 1)
-    a = EP_PI(h, motion.goal(penv.f, K))
-    alive = ~penv.done_eval.clone()
-    f_now = penv.f.clone()
-    out = penv.step(a)
-    ff = torch.where(alive & (out["term"] | ~torch.isfinite(a).all(-1)), f_now, EPG["fail_f"])  # non-finite world: failed
-    penv.done_eval |= penv.f >= EPG["stop"]
-    f1 = torch.minimum(penv.f, EPG["fcap"])
-    # the simulator wrapper rebinds these per step: copy them back into the static tensors the graph reads
-    EPG["hist"].copy_(h), EPG["fail_f"].copy_(ff), EPG["f"].copy_(f1)
-    EPG["ep_step"].copy_(penv.ep_step), EPG["a_prev"].copy_(penv.a_prev)
-    penv.f, penv.ep_step, penv.a_prev = EPG["f"], EPG["ep_step"], EPG["a_prev"]
-
-
-@torch.no_grad()
-def eprobe_sweep_graphed(n_steps, stop, fcap):
-    for _ in range(eprobe_graph_setup(n_steps, stop, fcap)):
-        EPG["graph"].replay()
-    return EPG["fail_f"].clone()
-
-
-@torch.no_grad()
-def eprobe_graph_setup(n_steps, stop, fcap):
-    """eprobe_sweep_eager as replays of one captured step. The first history (H copies of o_0) is set eagerly; the
-    first step shifts in o_0 again (the state has not moved), so the histories match the eager loop."""
-    import warp as wp
-    from mjlab.sim.sim_data import TorchArray
-
-    if not EPG:
-        EPG.update(hist=torch.zeros(P_EP, Hh, mdp.obs_dim, device=dev), fail_f=torch.zeros(P_EP, dtype=torch.long, device=dev),
-                   stop=torch.zeros(P_EP, dtype=torch.long, device=dev), fcap=torch.zeros(P_EP, dtype=torch.long, device=dev),
-                   f=penv.f.clone(), ep_step=penv.ep_step.clone(),
-                   a_prev=penv.a_prev.clone())  # fmt: skip
-    EPG["stop"].copy_(stop), EPG["fcap"].copy_(fcap), EPG["fail_f"].fill_(-1)
-    EPG["f"].copy_(penv.f), EPG["ep_step"].copy_(penv.ep_step), EPG["a_prev"].copy_(penv.a_prev)
-    penv.f, penv.ep_step, penv.a_prev = EPG["f"], EPG["ep_step"], EPG["a_prev"]
-    EPG["hist"].copy_(penv.observe().unsqueeze(1).expand(-1, Hh, -1))
-    penv._obs = None
-    if "graph" not in EPG:
-        for _ in range(3):  # warmup on the default stream (Warp's own stream orders with it implicitly)
-            _eprobe_step()
-        n_steps -= 3  # the warmup steps are sweep steps; the capture below records its step without running it
-        torch.cuda.synchronize()
-        t0 = time.time()
-        EPG["graph"] = torch.cuda.CUDAGraph()
-        # mjlab writes simulator arrays on Warp's stream and launches Warp's own step graph, neither of which may enter a
-        # torch capture: write on the capture stream, launch the step's kernels (Warp's capture_while solver loop becomes a
-        # conditional node of this graph)
-        setitem, penv.sim.use_cuda_graph = TorchArray.__setitem__, False
-        TorchArray.__setitem__ = lambda self, idx, value: self._tensor.__setitem__(idx, value)
-        try:
-            # own capture stream: cuBLAS workspaces are keyed by stream, and graphs captured on torch's shared default capture
-            # stream would share one workspace with the training graphs that this graph runs concurrently with (--eprobe_async)
-            with torch.cuda.graph(EPG["graph"], stream=torch.cuda.Stream(), capture_error_mode="thread_local"):
-                ws = wp.stream_from_torch(torch.cuda.current_stream())
-                with wp.ScopedStream(ws, sync_enter=False, sync_exit=False):
-                    wp.capture_begin(stream=ws, external=True)
-                    try:
-                        _eprobe_step()
-                    finally:
-                        EPG["wp_graph"] = wp.capture_end(stream=ws)  # keep: it holds the captured kernels' modules
-        finally:
-            TorchArray.__setitem__, penv.sim.use_cuda_graph = setitem, True
-        torch.cuda.synchronize()
-        print(f"--eprobe_graph: captured one sweep step in {time.time() - t0:.1f} s", flush=True)
-    return n_steps  # steps left to replay
-
-
 @torch.no_grad()
 def eprobe_burst(it):
     """--eprobe_share: one sweep of deployed-policy rollouts (evaluation conditions, EMA policy) over all clips; first
@@ -806,42 +625,8 @@ def eprobe_burst(it):
     penv.done_eval[:] = False
     penv.failed_eval[:] = False
     penv.reset(ids, f0)
-    if args.eprobe_async:
-        avg = list(pi_avg.module.parameters()) + list(pi_avg.module.buffers())
-        torch._foreach_copy_(list(EP_PI.parameters()) + list(EP_PI.buffers()), avg)
-        EP_ASYNC.update(it=it, lead=lead, t0=t0, left=eprobe_graph_setup(lead + args.eprobe_tile, stop, fcap), first=True)
-        return
-    if args.eprobe_graph:
-        fail_f = eprobe_sweep_graphed(lead + args.eprobe_tile, stop, fcap)
-    else:
-        fail_f = eprobe_sweep_eager(lead + args.eprobe_tile, stop, fcap)
+    fail_f = eprobe_sweep_eager(lead + args.eprobe_tile, stop, fcap)
     eprobe_finish(it, lead, t0, fail_f)
-
-
-@torch.no_grad()
-def eprobe_async_tick(launch):
-    """--eprobe_async, per iteration: launch=False: if the running sweep's last steps were launched in an earlier iteration,
-    wait for them and apply its failures; launch=True: launch the next steps of the running sweep on the side stream."""
-    if not EP_ASYNC:
-        return
-    if not launch:
-        if EP_ASYNC["left"] == 0:
-            torch.cuda.current_stream().wait_event(EP_ASYNC["done"])
-            eprobe_finish(EP_ASYNC["it"], EP_ASYNC["lead"], EP_ASYNC["t0"], EPG["fail_f"].clone())
-            EP_ASYNC.clear()
-        return
-    if EP_ASYNC["left"] == 0:
-        return
-    if EP_ASYNC.pop("first", False):
-        EP_SIDE.wait_stream(torch.cuda.current_stream())  # the reset, static inputs and policy snapshot
-    k = min(args.eprobe_async, EP_ASYNC["left"])
-    with torch.cuda.stream(EP_SIDE):
-        for _ in range(k):
-            EPG["graph"].replay()
-    EP_ASYNC["left"] -= k
-    if EP_ASYNC["left"] == 0:
-        EP_ASYNC["done"] = torch.cuda.Event()
-        EP_ASYNC["done"].record(EP_SIDE)
 
 
 def eprobe_finish(it, lead, t0, fail_f):
@@ -857,7 +642,7 @@ def eprobe_finish(it, lead, t0, fail_f):
         env.set_focus(q / q.sum(), args.eprobe_share)
     nf = int((fail_f >= 0).sum())
     fl = sorted({(m.names[int(m.clip_id[f])].replace("_subject", "_s"), int(f - m.clip_start[m.clip_id[f]])) for f in fail_f[fail_f >= 0].tolist()})
-    lag = f" | applied at it {ITER_NOW[0]}" if args.eprobe_async else ""
+    lag = ""
     print(f"--eprobe it {it}: lead {lead} | {nf}/{P} failures {fl[:8]} | {time.time() - t0:.1f} s{lag}", flush=True)
 
 
@@ -915,14 +700,8 @@ for it in range(start_it, args.iterations):
     step_acc += 1.0 / args.utd
     n = int(step_acc)
     step_acc -= n
-    if args.eprobe_async:
-        ITER_NOW[0] = it
-        eprobe_async_tick(launch=False)
-        assert not (EP_ASYNC and it >= args.eprobe_start and it % args.eprobe_every == 0), "--eprobe_async too small"
     if EPROBE and it >= args.eprobe_start and it % args.eprobe_every == 0:
         eprobe_burst(it)
-    if args.eprobe_async:
-        eprobe_async_tick(launch=True)
     collect(n, stats)
     for _ in range(args.wm_batches):
         l, e8 = wm_update_g()

@@ -11,7 +11,7 @@ signal chain, as on a real robot's state estimator:
 * Observation delay: 0 or 1 policy step on everything read from hardware, lag held with a probability.
 
 These are stateful. :class:`ObsPipeline` steps them on the simulator every physics step (from
-MuJoCo's IMU sensors) and in imagination once per control step (from world-model states); the raw
+Genesis link accelerations and IMU-site kinematics) and in imagination once per control step (from world-model states); the raw
 joint-velocity noise is rescaled so both give the same filtered variance.
 """
 

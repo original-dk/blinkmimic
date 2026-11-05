@@ -7,7 +7,7 @@ in **2.9 min of training on one RTX 4090** (mean of 3 seeds), and to 0.82 with 0
 checkpoints in a row in **3.4 min**.
 
 Like SuperMimic and InstantTrack, BlinkMimic learns one differentiable world model and trains the policy by backpropagation through
-imagined rollouts, on [mjlab](https://github.com/mujocolab/mjlab) / MuJoCo Warp. BlinkMimic changes how the policy
+imagined rollouts. This branch uses [Genesis](https://github.com/Genesis-Embodied-AI/Genesis) for simulation. BlinkMimic changes how the policy
 is optimized and where the simulator spends its resets ([details](#what-blinkmimic-changes)).
 
 ![Equal training time (3.1 min). SuperMimic and InstantTrack v1.2 fall on fallAndGetUp1_subject1; BlinkMimic tracks it.](docs/static/hero.gif)
@@ -16,6 +16,9 @@ is optimized and where the simulator spends its resets ([details](#what-blinkmim
 simulated in MuJoCo Warp under evaluation conditions. Blue ghost: reference motion. A faded panel has fallen.*
 
 ## Results
+
+The results and timings below were measured with the original mjlab / MuJoCo Warp backend.
+They have not been reproduced on Genesis; the simulator and contact solver now differ.
 
 All runs on one RTX 4090 (driver 580, CUDA 12.8, torch 2.9.0), the GPU otherwise idle. 40 LAFAN1 clips; every
 checkpoint (one per 100 iterations) evaluated on all 40 clips from their first frame with 4 replicas; return and
@@ -100,18 +103,43 @@ Linux x86_64, an NVIDIA GPU with a driver for CUDA 12.8, [uv](https://docs.astra
 ```bash
 git clone https://github.com/fuyichen0725/blinkmimic.git
 cd blinkmimic
-uv sync                          # .venv with mjlab, MuJoCo Warp, Warp, torch 2.9.0 (CUDA 12.8)
+uv sync --locked                 # Genesis 1.4.5, MuJoCo (asset parsing / FK), torch 2.9.0 (CUDA 12.8)
 tools/download_data.sh           # 40 G1-retargeted LAFAN1 clips + G1 description -> data/
-uv run python tools/test_env.py  # sanity check: FK vs simulator, state round-trip, reference playback
+uv run --locked python tools/test_env.py  # FK vs Genesis, state round-trip, reference playback
 ```
 
 ## Train, evaluate, reproduce
 
-> **Train on an otherwise idle GPU.** On a shared GPU, `--eprobe_async` can crash with an illegal memory access;
-> add `--eprobe_async 0` there.
+Genesis steps the simulator and evaluation probes eagerly. The released preset retains CUDA graphs for neural
+updates; the old `--collect_graph`, `--reset_masked`, `--eprobe_graph` and nonzero `--eprobe_async` flags are rejected.
+Domain randomization uses Genesis per-world friction, CoM, mass/inertia and joint-drive setters. Contact-solref
+randomization per world is unavailable in Genesis and raises an error when configured. The default G1 recipe does
+not use it. Joint/action order is preserved through named DOF mapping; root angular velocities are converted between
+world coordinates and the free joint's local frame.
+
+Small CPU checks (no NVIDIA GPU required; use a writable `XDG_CACHE_HOME` and `MPLCONFIGDIR` if needed):
 
 ```bash
-bash scripts/train.sh logs/run_s0 --seed 0          # ~8 min: 3500 iterations, a policy checkpoint every 100
+uv run --locked python tools/test_env.py --device cpu --num_envs 2
+uv run --locked python tools/test_dr.py --device cpu
+uv run --locked python tools/reset_check.py --device cpu --num_envs 4
+uv run --locked python tools/test_train.py --device cpu  # structured / Muon recipe and checkpoint resume
+uv run --locked python -m blinkmimic.train --device cpu --eager --amp none \
+  --num_envs 2 --iterations 3 --buffer_steps 32 --warmup_steps 12 \
+  --wm_window 2 --wm_batches 1 --wm_batch 4 --pi_batch 4 --horizon 2 \
+  --goal_frames 2 --hist 2 --wm_hidden 32,32 --enc_hidden 32,16 --dec_hidden 32,16 \
+  --critic_epochs 1 --critic_minibatches 1 --wm_only_iters 0 --log_every 1 \
+  --ckpt_every 1 --ckpt_minutes 0 --log_dir logs/genesis_smoke
+```
+
+These smoke runs check collection, model/policy/critic updates and checkpointing; they do not establish policy
+convergence or GPU performance. Mesh downloads may redirect to `us.aws.cdn.hf.co`; allow that destination alongside
+`huggingface.co` when using the data downloader.
+
+For the full GPU recipe:
+
+```bash
+bash scripts/train.sh logs/run_s0 --seed 0          # 3500 iterations, a policy checkpoint every 100; Genesis timing not benchmarked
 uv run python tools/eval_batch.py --run_dir logs/run_s0 --group 18 --reps 4   # 18 checkpoints per batch
 uv run python tools/time_to_target.py logs/run_s0
 bash scripts/reproduce.sh logs/reproduce             # the table above: 3 seeds, evaluation, time to target
@@ -119,7 +147,7 @@ bash scripts/reproduce.sh logs/reproduce             # the table above: 3 seeds,
 
 Other tools: `tools/eval_metrics.py` (accuracy and contact metrics), `tools/render.py` (videos from
 `python -m blinkmimic.evaluate --record`), `tools/export_onnx.py` and `tools/play_onnx.py` (deployment format and a
-check of it in the simulator; `play_onnx.py` needs `onnxruntime`: `uv run --with onnxruntime python tools/play_onnx.py ...`).
+check of it in the simulator; `play_onnx.py` needs the export extra and `onnxruntime`: `uv run --extra export --with onnxruntime python tools/play_onnx.py ...`).
 
 ## Attribution and licenses
 
@@ -132,7 +160,7 @@ check of it in the simulator; `play_onnx.py` needs `onnxruntime`: `uv run --with
   protocol. Muon (Jordan et al., 2024; Liu et al., "Muon is Scalable for LLM Training", 2025).
 - **Also consulted.** [rethinking-supermimic](https://github.com/btx0424/rethinking-supermimic) (btx0424) and the
   SuperMimic reimplementations listed in [awesome-supermimic](https://github.com/miao-org/awesome-supermimic).
-- **Simulation.** [mjlab](https://github.com/mujocolab/mjlab), [MuJoCo](https://mujoco.org),
+- **Simulation.** This branch uses [Genesis](https://github.com/Genesis-Embodied-AI/Genesis) (Apache-2.0). The original implementation used [mjlab](https://github.com/mujocolab/mjlab), [MuJoCo](https://mujoco.org),
   [MuJoCo Warp](https://github.com/google-deepmind/mujoco_warp), [NVIDIA Warp](https://github.com/NVIDIA/warp)
   (Apache-2.0) and [PyTorch](https://pytorch.org) (BSD-3-Clause).
 - **Data.** LAFAN1 motions by Ubisoft La Forge (Harvey et al., SIGGRAPH 2020), license **CC BY-NC-ND 4.0**; G1

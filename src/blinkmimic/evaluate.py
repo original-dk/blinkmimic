@@ -33,10 +33,10 @@ parser.add_argument("--dr_parts", type=str, default="all", choices=["all", "dyna
                     help="with --dr_from: take only its simulator randomization or only its sensing")
 parser.add_argument("--repeats", type=int, default=1, help="rollouts per clip")
 parser.add_argument("--seed", type=int, default=0)
+parser.add_argument("--device", type=str, default="cuda:0")
 args = parser.parse_args()
 
 import dataclasses
-import re
 
 import numpy as np
 import torch
@@ -60,15 +60,13 @@ def transfer_dr(target: RobotSpec, source: RobotSpec, parts: str = "all") -> Rob
         return dataclasses.replace(transfer_dr(target, source), sensing=target.sensing)
     if target.name == source.name:
         return target
-    src_acts = source.robot_cfg().articulation.actuators
-    tgt_acts = target.robot_cfg().articulation.actuators
-    joints = lambda act, names: {n for n in names if any(re.fullmatch(p, n) for p in act.target_names_expr)}  # noqa: E731
-    entries = [(set().union(*(joints(src_acts[i], source.joint_names) for i in ids)), kp, kd) for ids, kp, kd in source.dr.pd_gain_scale]
+    entries = [({source.joint_names[i] for i in ids}, kp, kd) for ids, kp, kd in source.dr.pd_gain_scale]
     groups: dict[int, list[int]] = {}
-    for i, act in enumerate(tgt_acts):
-        tj = joints(act, target.joint_names)
-        best = max(range(len(entries)), key=lambda e: len(tj & entries[e][0]))
-        groups.setdefault(best, []).append(i)
+    for i, name in enumerate(target.joint_names):
+        if entries:
+            best = max(range(len(entries)), key=lambda e: int(name in entries[e][0]))
+            if name in entries[best][0]:
+                groups.setdefault(best, []).append(i)
     pd = tuple((tuple(ids), entries[e][1], entries[e][2]) for e, ids in sorted(groups.items()))
     dr = dataclasses.replace(source.dr, pd_gain_scale=pd)
     return dataclasses.replace(target, dr=dr, sensing=source.sensing, com_range=source.com_range)
@@ -76,7 +74,7 @@ def transfer_dr(target: RobotSpec, source: RobotSpec, parts: str = "all") -> Rob
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.manual_seed(args.seed)
-dev = "cuda:0"
+dev = args.device
 robot = get_robot(args.robot)
 if args.dr_from:
     robot = transfer_dr(robot, robot if args.dr_from == "self" else get_robot(args.dr_from), args.dr_parts)
@@ -93,7 +91,7 @@ clip_of = torch.arange(N, device=dev) % C
 def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
     a_ = ck["args"]
     K, Hh = a_["goal_frames"], a_["hist"]
-    networks.AMP_DTYPE = torch.bfloat16 if a_.get("amp", "none") == "bf16" else None
+    networks.AMP_DTYPE = torch.bfloat16 if a_.get("amp", "none") == "bf16" and torch.device(dev).type == "cuda" else None
     widths = lambda key, default: tuple(int(x) for x in a_.get(key, default).split(","))  # noqa: E731
     pi = Policy(mdp.obs_dim, motion.goal_dim(K), robot.num_joints, hist=Hh, enc_hidden=widths("enc_hidden", "2048,1024,512,256"),
                 dec_hidden=widths("dec_hidden", "2048,1024,512,256"), **policy_kwargs(a_, robot)).to(dev)  # fmt: skip

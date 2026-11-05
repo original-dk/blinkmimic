@@ -1,7 +1,7 @@
 """Robot description shared by the motion library, FK, MDP and simulator.
 
 Each robot lives in its own package ``blinkmimic/<name>/`` whose ``<name>_constants.py`` defines
-``SPEC``: the MJCF, joint/body names, actuators (an mjlab ``EntityCfg``) and the motion format.
+``SPEC``: the MJCF, joint/body names, joint drives and the motion format.
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ from dataclasses import field
 from typing import Callable
 
 import numpy as np
-from mjlab.entity import EntityCfg
 
 from .dr import DomainRandCfg
 from .sensing import SensingCfg
@@ -23,12 +22,20 @@ MotionArrays = tuple[np.ndarray, np.ndarray, np.ndarray, float]
 
 
 @dataclass(frozen=True)
+class JointDrive:
+    stiffness: float
+    damping: float
+    effort_limit: float
+    armature: float
+
+
+@dataclass(frozen=True)
 class RobotSpec:
     name: str
     mjcf_path: str
     """Robot MJCF; the simulated entity and the torch FK are both built from it."""
     joint_names: tuple[str, ...]
-    """Actuated joints in motion-file / action order (must equal the MJCF joint order)."""
+    """Actuated joints in motion-file / action order (mapped to Genesis DOFs by name)."""
     tracked_bodies: tuple[str, ...]
     """Bodies in the tracking reward; the first one is the root (anchor) body."""
     default_joint_pos: dict[str, float]
@@ -38,7 +45,8 @@ class RobotSpec:
     com_body: str
     """Body whose center of mass is randomized (part of the sim context xi)."""
     com_range: tuple[tuple[float, float], tuple[float, float], tuple[float, float]]
-    robot_cfg: Callable[[], EntityCfg]
+    drives: tuple[JointDrive, ...]
+    """PD drives in joint_names order, applied by Genesis."""
     motion_dir: str
     motion_glob: str
     load_motion: Callable[[str], MotionArrays]
@@ -46,9 +54,6 @@ class RobotSpec:
     """Simulator randomization (default: the paper's G1 setup)."""
     sensing: SensingCfg = field(default_factory=SensingCfg)
     """How the policy observation is sensed (default: true state plus Table A.1 noise)."""
-    njmax: int = 500
-    nconmax: int = 128
-    """MuJoCo-Warp constraint / contact capacity per world."""
 
     @property
     def num_joints(self) -> int:
@@ -70,8 +75,7 @@ class RobotSpec:
     @property
     def has_action_delay(self) -> bool:
         """Whether any actuator delays its command (then s_{t+1} also depends on a_{t-1})."""
-        art = self.robot_cfg().articulation
-        return art is not None and any(act.delay_max_lag > 0 for act in art.actuators)
+        return False
 
 
 def get_robot(name: str) -> RobotSpec:

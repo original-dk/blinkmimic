@@ -1,6 +1,6 @@
-"""Motion-tracking simulator on mjlab (MuJoCo-Warp).
+"""Motion-tracking simulator on Genesis.
 
-The environment is a thin batched wrapper: it applies the joint setpoint, steps MuJoCo-Warp, labels
+The environment is a thin batched wrapper: it applies the joint setpoint, steps Genesis, labels
 the transition with the analytic reward/termination of :mod:`blinkmimic.mdp`, and resets episodes to
 reference-motion states drawn by return-based bin sampling (SuperMimic paper Appendix D.1). Domain randomization
 (:mod:`blinkmimic.dr`) and the policy's sensing (:mod:`blinkmimic.sensing`) follow ``RobotSpec``.
@@ -8,14 +8,10 @@ reference-motion states drawn by return-based bin sampling (SuperMimic paper App
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+import genesis as gs
 import torch
-import mujoco_warp as mjwarp
-import warp as wp
-from mjlab.entity.data import EntityData
-from mjlab.utils.lab_api.math import quat_apply_inverse
-from mjlab.scene import Scene, SceneCfg
-from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
-from mjlab.terrains import TerrainEntityCfg
 
 from .dr import DomainRandomizer, XiLayout
 from .mdp import MAX_STEP_REWARD, MDP, flatten_state
@@ -24,65 +20,18 @@ from .robot import RobotSpec
 from .rotations import mat_to_quat, quat_to_mat, so3_exp
 from .sensing import ObsPipeline
 
-
-# A python scalar written through a tensor index (x[ids] = 0.0) is copied host-to-device from pageable memory, which
-# synchronizes the stream: 13 of the 14 host syncs per training step came from the reset path.
-# The same writes with a device-side 0-dim value do not synchronize and give identical values.
-def _dev_scalar(t: torch.Tensor, v):
-    return torch.full((), v, dtype=t.dtype, device=t.device)
-
-
-def _clear_state(self, env_ids=None) -> None:  # mjlab EntityData.clear_state without host syncs
-    if self.is_actuated:
-        env_ids = self._resolve_env_ids(env_ids)
-        for t in (self.joint_pos_target, self.joint_vel_target, self.joint_effort_target, self.tendon_len_target,
-                  self.tendon_vel_target, self.tendon_effort_target, self.site_effort_target):  # fmt: skip
-            t[env_ids] = _dev_scalar(t, 0.0)
-
-
-def _sim_reset(self, env_ids=None) -> None:  # mjlab Simulation.reset without host syncs
-    with wp.ScopedDevice(self.wp_device):
-        if env_ids is None:
-            self._reset_mask.fill_(True)
-        else:
-            self._reset_mask.fill_(False)
-            self._reset_mask[env_ids] = _dev_scalar(self._reset_mask._tensor, True)
-        if self.use_cuda_graph and self.reset_graph is not None:
-            wp.capture_launch(self.reset_graph)
-        else:
-            mjwarp.reset_data(self.wp_model, self.wp_data, reset=self._reset_mask_wp)
-
-
-EntityData.clear_state, Simulation.reset = _clear_state, _sim_reset
-
 DECIMATION = 4  # 4 physics substeps of 5 ms per 50 Hz control step
 PHYSICS_DT = CONTROL_DT / DECIMATION
 
 
-def make_scene_cfg(robot: RobotSpec, num_envs: int) -> SceneCfg:
-    return SceneCfg(
-        num_envs=num_envs,
-        env_spacing=0.0,
-        terrain=TerrainEntityCfg(terrain_type="plane"),
-        entities={"robot": robot.robot_cfg()},
-    )
+@dataclass(frozen=True)
+class SimulationCfg:
+    dt: float = PHYSICS_DT
+    iterations: int = 100
 
 
 def make_sim(robot: RobotSpec) -> SimulationCfg:
-    return SimulationCfg(
-        njmax=robot.njmax,
-        nconmax=robot.nconmax,
-        mujoco=MujocoCfg(
-            timestep=PHYSICS_DT,
-            integrator="implicitfast",
-            cone="pyramidal",
-            solver="newton",
-            iterations=100,
-            ls_iterations=50,
-            tolerance=1e-6,
-            ccd_iterations=35,
-        ),
-    )
+    return SimulationCfg()
 
 
 def _bin_ema_w(stat: torch.Tensor, bins: torch.Tensor, x: torch.Tensor, wt: torch.Tensor, old: float) -> torch.Tensor:
@@ -110,11 +59,35 @@ class TrackingSim:
         delay, and pushes; ``eval_mode`` switches evaluation bookkeeping (no auto-reset, episode starts
         exactly on the reference)."""
         self.device = device
-        self.scene = Scene(make_scene_cfg(robot, num_envs), device=device)
-        self.sim = Simulation(num_envs=num_envs, cfg=sim_cfg, model=self.scene.compile(), device=device)
-        self.scene.initialize(mj_model=self.sim.mj_model, model=self.sim.model, data=self.sim.data)
-        self.robot = self.scene["robot"]
-        assert list(self.robot.joint_names) == list(robot.joint_names), self.robot.joint_names
+        if not gs._initialized:
+            gs.init(backend=gs.cpu if torch.device(device).type == "cpu" else gs.cuda, logging_level="warning")
+        requested = torch.device(device)
+        if requested.type != gs.device.type or (requested.index is not None and requested.index != gs.device.index):
+            raise ValueError(f"Genesis is initialized on {gs.device}, requested {device}")
+        self.scene = gs.Scene(
+            sim_options=gs.options.SimOptions(dt=sim_cfg.dt),
+            rigid_options=gs.options.RigidOptions(enable_self_collision=False, iterations=sim_cfg.iterations,
+                                                 batch_links_info=True, batch_dofs_info=True),
+            show_viewer=False,
+        )
+        self.ground = self.scene.add_entity(gs.morphs.Plane(), material=gs.materials.Rigid(friction=robot.dr.friction_range[0]))
+        self.robot = self.scene.add_entity(gs.morphs.MJCF(file=robot.mjcf_path, align=False),
+                                           material=gs.materials.Rigid(friction=1.0))
+        self.scene.build(n_envs=num_envs, env_spacing=(0.0, 0.0))
+        self.dof_ids = [self.robot.get_joint(n).dofs_idx_local[0] for n in robot.joint_names]
+        self.q_ids = [self.robot.get_joint(n).qs_idx_local[0] for n in robot.joint_names]
+        root = next(j for j in self.robot.joints if j.type == gs.JOINT_TYPE.FREE)
+        self.root_dofs, self.root_qs = root.dofs_idx_local, root.qs_idx_local
+        self.root_link = self.robot.get_link(robot.tracked_bodies[0]).idx_local
+        t = lambda values: torch.tensor(values, device=device, dtype=torch.float32)  # noqa: E731
+        self.kp = t([d.stiffness for d in robot.drives])
+        self.kd = t([d.damping for d in robot.drives])
+        self.armature = t([d.armature for d in robot.drives])
+        effort = t([d.effort_limit for d in robot.drives])
+        self.robot.set_dofs_kp(self.kp, self.dof_ids)
+        self.robot.set_dofs_kv(self.kd, self.dof_ids)
+        self.robot.set_dofs_armature(self.armature, self.dof_ids)
+        self.robot.set_dofs_force_range(-effort, effort, self.dof_ids)
         self.N = num_envs
         self.J = robot.num_joints
         self.spec = robot
@@ -124,7 +97,7 @@ class TrackingSim:
         self.max_episode_steps = max_episode_steps if not eval_mode else 10**9
         self.reset_noise = reset_noise and not eval_mode
         dev = self.device
-        self.default_q = self.robot.data.default_joint_pos[0].clone()
+        self.default_q = torch.tensor(robot.default_joint_pos_list(), device=dev)
         self.alpha = torch.tensor(robot.action_scale_list(), device=dev)
 
         # ---- sim context xi (layout in blinkmimic.dr; paper setup: friction, joint offsets, com offset) ----
@@ -138,10 +111,6 @@ class TrackingSim:
         self.pipe = ObsPipeline(robot, mdp, self.layout, dev, PHYSICS_DT)
         self.obs_fresh = torch.ones(self.N, dtype=torch.bool, device=dev)
         self._obs = self._obs_state = None
-        if robot.sensing.imu is not None:
-            m = self.sim.mj_model
-            adr = lambda name: int(m.sensor_adr[m.sensor(f"robot/{name}").id])  # noqa: E731
-            self._gyro_adr, self._accel_adr = adr(robot.sensing.imu.gyro_sensor), adr(robot.sensing.imu.accel_sensor)
         self.push_timer = torch.zeros(self.N, device=dev)
         self.push_enabled = robot.dr.push_interval_s is not None and self.randomize
         if self.push_enabled:
@@ -179,16 +148,20 @@ class TrackingSim:
 
     # ------------------------------------------------------------------ state
     def state(self):
-        # root state from the free joint (qpos/qvel are current after a step; derived xpos lag a substep)
-        idx = self.robot.indexing
-        root_q = self.sim.data.qpos[:, idx.free_joint_q_adr]
-        root_v = self.sim.data.qvel[:, idx.free_joint_v_adr]
-        p = root_q[:, :3] - self.scene.env_origins
-        R = quat_to_mat(root_q[:, 3:7])  # MuJoCo uses wxyz
-        # free joint velocity: world-frame linear velocity of the root origin, angular velocity in the root frame
-        w = (R @ root_v[:, 3:6].unsqueeze(-1)).squeeze(-1)
-        d = self.robot.data
-        return (p, R, root_v[:, :3].clone(), w, d.joint_pos.clone(), d.joint_vel.clone())
+        p = self.robot.get_links_pos([self.root_link])[:, 0]
+        R = quat_to_mat(self.robot.get_links_quat([self.root_link])[:, 0])
+        v = self.robot.get_links_vel([self.root_link])[:, 0]
+        w = self.robot.get_links_ang([self.root_link])[:, 0]
+        return (p, R, v, w, self.robot.get_dofs_position(self.dof_ids), self.robot.get_dofs_velocity(self.dof_ids))
+
+    def _write_state(self, env_ids, p, R, v, w, q, qd):
+        # Free-joint linear velocity is world-frame; angular velocity is root-local.
+        self.robot.set_qpos(torch.cat((p, mat_to_quat(R)), -1), self.root_qs, env_ids, zero_velocity=False)
+        self.robot.set_qpos(q, self.q_ids, env_ids, zero_velocity=False)
+        w_local = (R.transpose(-1, -2) @ w.unsqueeze(-1)).squeeze(-1)
+        self.robot.set_dofs_velocity(torch.cat((v, w_local), -1), self.root_dofs, env_ids)
+        self.robot.set_dofs_velocity(qd, self.dof_ids, env_ids)
+        self.robot.control_dofs_position(q, self.dof_ids, env_ids)
 
     # ------------------------------------------------------------------ reset
     def sample_frames(self, n: int, gate: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
@@ -236,27 +209,18 @@ class TrackingSim:
             if c.reset_joint_vel > 0:
                 qd = qd + torch.empty_like(qd).uniform_(-c.reset_joint_vel, c.reset_joint_vel)
         q = torch.clamp(q, self.mdp.kin.q_lo, self.mdp.kin.q_hi)
-        # mjlab's reset clears solver warm-start data and actuator targets, so it runs before the writes
-        self.sim.reset(env_ids)
-        self.scene.reset(env_ids)
-        pose = torch.cat((p + self.scene.env_origins[env_ids], mat_to_quat(R)), -1)
-        self.robot.write_root_link_pose_to_sim(pose, env_ids=env_ids)
-        self.robot.write_root_link_velocity_to_sim(torch.cat((v, w), -1), env_ids=env_ids)
-        self.robot.write_joint_position_to_sim(q, env_ids=env_ids)
-        self.robot.write_joint_velocity_to_sim(qd, env_ids=env_ids)
-        self.robot.set_joint_position_target(q, env_ids=env_ids)
+        self._write_state(env_ids, p, R, v, w, q, qd)
         self.f[env_ids] = frames
-        self.ep_step.index_fill_(0, env_ids, 0)  # index_fill_: no host sync (see _dev_scalar)
+        self.ep_step.index_fill_(0, env_ids, 0)
         self.a_prev.index_fill_(0, env_ids, 0.0)
         self.start_bin[env_ids] = bins
         self.ep_disc_ret.index_fill_(0, env_ids, 0.0)
         self.ep_ret.index_fill_(0, env_ids, 0.0)
-        self.randomizer.reset(self.xi, env_ids)  # after scene.reset, which would restore actuator defaults
+        self.randomizer.reset(self.xi, env_ids)
         self.obs_fresh.index_fill_(0, env_ids, True)
 
     def use_static_focus(self):
-        """Keep the focus distribution and share in fixed device tensors (updated in place by set_focus), so a captured
-        reset_masked follows them."""
+        """Keep the focus distribution and share in fixed device tensors, updated in place by set_focus."""
         self.focus_static = True
         self.focus_q = torch.full((self.motion.num_bins,), 1.0 / self.motion.num_bins, device=self.device)
         self.focus_share_t = torch.zeros((), device=self.device)
@@ -268,65 +232,12 @@ class TrackingSim:
             self.focus_q, self.focus_share = q, share
 
     def reset_masked(self, mask: torch.Tensor, frames: torch.Tensor | None = None):
-        """reset() of the worlds where ``mask`` is true, as fixed-size masked updates of all worlds (no host-side ids, so
-        it can be captured in a CUDA graph). Worlds outside the mask are left bitwise unchanged; the reset worlds get the
-        same values as reset() would give them for the same frames and random draws (random draws are made for all
-        worlds, so the random stream differs from reset()). Only the configuration used here is supported: no pushes,
-        no sensing state, no per-episode mjlab randomization terms, no actuator delays."""
-        assert not self.eval_mode and not self.pipe.stateful and not self.push_enabled
-        assert not self.randomizer._terms and self.spec.dr.solref_geoms is None and self.spec.dr.com_mass_range is None
-        N, dev, m, c = self.N, self.device, self.motion, self.spec.dr
-        d = mask
-        d1 = d.unsqueeze(-1)
-        if frames is None:
-            frames, bins = self.sample_frames(N, gate=d.any())
-        else:
-            bins = m.frame_bin[frames]
-        p, R, v, w, q, qd = (x.clone() for x in m.ref_state(frames))
-        if self.reset_noise:
-            u = lambda half: torch.stack([torch.empty(N, device=dev).uniform_(-h, h) for h in half], -1)  # noqa: E731
-            p = p + u(c.reset_pos)
-            R = so3_exp(u(c.reset_rot)) @ R
-            v = v + u(c.reset_lin_vel)
-            w = w + u(c.reset_ang_vel)
-            q = q + torch.empty_like(q).uniform_(-c.reset_joint_pos, c.reset_joint_pos)
-            if c.reset_joint_vel > 0:
-                qd = qd + torch.empty_like(qd).uniform_(-c.reset_joint_vel, c.reset_joint_vel)
-        q = torch.clamp(q, self.mdp.kin.q_lo, self.mdp.kin.q_hi)
-        # Simulation.reset (solver warm start, controls, ...) of the masked worlds, before the writes
-        sim = self.sim
-        sim._reset_mask.copy_(d)
-        with wp.ScopedDevice(sim.wp_device):
-            if sim.use_cuda_graph and sim.reset_graph is not None:
-                wp.capture_launch(sim.reset_graph)
-            else:
-                mjwarp.reset_data(sim.wp_model, sim.wp_data, reset=sim._reset_mask_wp)
-        # Scene.reset: the robot's actuator targets (no actuator delays, no sensors; the terrain has no state)
-        ed = self.robot.data
-        for t in (ed.joint_pos_target, ed.joint_vel_target, ed.joint_effort_target, ed.tendon_len_target,
-                  ed.tendon_vel_target, ed.tendon_effort_target, ed.site_effort_target):  # fmt: skip
-            t.masked_fill_(d.view(-1, *([1] * (t.dim() - 1))), 0.0)
-        # the writes of reset(): root pose, root velocity (angular in the new root frame), joints, position targets
-        idx = self.robot.indexing
-        qa, va = idx.free_joint_q_adr, idx.free_joint_v_adr
-        qpos, qvel = sim.data.qpos, sim.data.qvel
-        pose = torch.cat((p + self.scene.env_origins, mat_to_quat(R)), -1)
-        qpos[:, qa] = torch.where(d1, pose, qpos[:, qa])
-        qvel[:, va] = torch.where(d1, torch.cat((v, quat_apply_inverse(pose[:, 3:7], w)), -1), qvel[:, va])
-        qpos[:, idx.joint_q_adr] = torch.where(d1, q, qpos[:, idx.joint_q_adr])
-        qvel[:, idx.joint_v_adr] = torch.where(d1, qd, qvel[:, idx.joint_v_adr])
-        ed.joint_pos_target.copy_(torch.where(d1, q, ed.joint_pos_target))
-        self.f.copy_(torch.where(d, frames, self.f))
-        self.ep_step.masked_fill_(d, 0)
-        self.a_prev.masked_fill_(d1, 0.0)
-        self.start_bin.copy_(torch.where(d, bins, self.start_bin))
-        self.ep_disc_ret.masked_fill_(d, 0.0)
-        self.ep_ret.masked_fill_(d, 0.0)
-        self.randomizer.reset_masked(self.xi, d)
-        self.obs_fresh |= d
+        """Reset selected worlds. Genesis setters use explicit environment indices."""
+        ids = mask.nonzero(as_tuple=False).squeeze(-1)
+        self.reset(ids, None if frames is None else frames[ids])
 
     def step_tail_masked(self, out: dict) -> dict:
-        """step_tail() without host-side ids (capturable): bin statistics of the ended episodes and reset_masked. Instead
+        """step_tail() with masked bin-statistic updates and indexed Genesis resets. Instead
         of per-episode tensors, out gets n_done and the sums ep_len_sum / ep_ret_norm_sum over the ended episodes."""
         assert self.bin_fix, "reset_masked needs --bin_fix (the index_put_ update keeps an arbitrary episode per bin)"
         done, term, f = out["done"], out["term"], out["f"]
@@ -346,13 +257,19 @@ class TrackingSim:
         return out
 
     def refresh(self):
-        """Recompute derived quantities (body poses) so the robot's mjlab data match ``state()`` after a reset."""
-        self.sim.forward()
+        """Genesis state setters update forward kinematics immediately."""
 
     # ------------------------------------------------------------------ observation
     def _imu_site(self) -> tuple[torch.Tensor, torch.Tensor]:
-        d = self.sim.data.sensordata
-        return d[:, self._gyro_adr : self._gyro_adr + 3], d[:, self._accel_adr : self._accel_adr + 3]
+        S = self.state()
+        Rs = S[1] @ self.pipe.site_rot
+        gyro = (Rs.transpose(-1, -2) @ S[3].unsqueeze(-1)).squeeze(-1)
+        acc = self.robot.get_links_acc([self.root_link])[:, 0]
+        ang_acc = self.robot.get_links_acc_ang([self.root_link])[:, 0]
+        offset = (S[1] @ self.pipe.site_pos.expand(self.N, -1).unsqueeze(-1)).squeeze(-1)
+        acc = acc + torch.cross(ang_acc, offset, dim=-1) + torch.cross(S[3], torch.cross(S[3], offset, dim=-1), dim=-1)
+        acc = acc + acc.new_tensor((0.0, 0.0, 9.81))
+        return gyro, (Rs.transpose(-1, -2) @ acc.unsqueeze(-1)).squeeze(-1)
 
     def observe(self) -> torch.Tensor:
         """Policy observation of the current state (training: noisy; eval: noise- and delay-free)."""
@@ -384,10 +301,11 @@ class TrackingSim:
         ids = due.nonzero(as_tuple=False).squeeze(-1)
         if len(ids) > 0:
             c = self.spec.dr
-            _, _, v, w, _, _ = self.state()
+            _, R, v, w, _, _ = self.state()
             kick = torch.stack([torch.empty(len(ids), device=self.device).uniform_(-h, h) for h in c.push_velocity], -1)
             vel = torch.cat((v[ids], w[ids]), -1) + kick
-            self.robot.write_root_link_velocity_to_sim(vel, env_ids=ids)
+            vel[:, 3:] = (R[ids].transpose(-1, -2) @ vel[:, 3:].unsqueeze(-1)).squeeze(-1)
+            self.robot.set_dofs_velocity(vel, self.root_dofs, ids)
             self.push_timer[ids] = torch.empty(len(ids), device=self.device).uniform_(*c.push_interval_s)
         return due
 
@@ -401,8 +319,8 @@ class TrackingSim:
         return self.step_tail(out)
 
     def step_core(self, a: torch.Tensor) -> dict:
-        """The step up to the episode ends: no host synchronization (pushes aside), so it can be captured in a CUDA
-        graph (train.py --collect_graph). The simulator wrapper rebinds f, ep_step and a_prev."""
+        """The step up to the episode ends, using eager Genesis stepping.
+        The simulator wrapper rebinds f, ep_step and a_prev."""
         if self.pipe.stateful and self._obs is None:
             self.observe()
         o, o_state = self._obs, self._obs_state
@@ -413,14 +331,12 @@ class TrackingSim:
         a_prev = self.a_prev.clone()
         ep_step = self.ep_step.clone()
         target = self.default_q + xi[:, 1 : 1 + self.J] + self.alpha * a
-        self.robot.set_joint_position_target(target)
+        self.robot.control_dofs_position(target, self.dof_ids)
         for _ in range(DECIMATION):
-            self.scene.write_data_to_sim()
-            self.sim.step()
-            self.scene.update(PHYSICS_DT)
+            self.scene.step()
             if self.pipe.stateful:
                 gyro, accel = self._imu_site() if self.spec.sensing.imu is not None else (None, None)
-                self._obs_state = self.pipe.filter_update(self._obs_state, self.robot.data.joint_vel, gyro, accel, self.xi,
+                self._obs_state = self.pipe.filter_update(self._obs_state, self.robot.get_dofs_velocity(self.dof_ids), gyro, accel, self.xi,
                                                           PHYSICS_DT, noise=self.randomize)  # fmt: skip
         S1 = self.state()
         f1 = f + 1

@@ -7,6 +7,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--robot", type=str, default="g1")
 parser.add_argument("--motion_dir", type=str, default=None)
 parser.add_argument("--num_envs", type=int, default=64)
+parser.add_argument("--device", type=str, default="cuda:0")
 args = parser.parse_args()
 
 import torch
@@ -19,7 +20,7 @@ from blinkmimic.motion import MotionLib
 from blinkmimic.robot import get_robot
 from blinkmimic.rotations import quat_to_mat, rot_angle_sq
 
-dev = "cuda:0"
+dev = args.device
 robot = get_robot(args.robot)
 kin = Kinematics(robot, dev)
 t0 = time.time()
@@ -35,23 +36,28 @@ ref = motion.ref_state(frames)
 names = ["p", "R", "v", "w", "q", "qd"]
 for n, a, b in zip(names, S, ref):
     print(f"roundtrip {n}: max err {(a - b).abs().max().item():.2e}")
+    torch.testing.assert_close(a, b, atol=2e-5, rtol=1e-5)
 # FK vs sim body frames
-d = env.robot.data
-ids = [env.robot.body_names.index(b) for b in robot.tracked_bodies]
-sp = d.body_link_pos_w[:, ids]
-sR = quat_to_mat(d.body_link_quat_w[:, ids])  # wxyz
+ids = [env.robot.get_link(b).idx_local for b in robot.tracked_bodies]
+sp = env.robot.get_links_pos(ids)
+sR = quat_to_mat(env.robot.get_links_quat(ids))
 bp, bR, bv, bw = kin.forward(*S)
 print("FK pos err", (bp - sp).norm(dim=-1).max().item())
 print("FK rot err", rot_angle_sq(bR, sR).sqrt().max().item())
-sv = d.body_link_vel_w[:, ids]
+sv = torch.cat((env.robot.get_links_vel(ids), env.robot.get_links_ang(ids)), -1)
 print("FK linvel err", (bv - sv[..., :3]).norm(dim=-1).max().item(), " angvel err", (bw - sv[..., 3:]).norm(dim=-1).max().item())
 print("ref body vs FK(sim) pos err", (motion.body_p[frames] - bp).norm(dim=-1).max().item())
+torch.testing.assert_close(bp, sp, atol=2e-5, rtol=1e-5)
+torch.testing.assert_close(bR, sR, atol=2e-5, rtol=1e-5)
+torch.testing.assert_close(bv, sv[..., :3], atol=2e-5, rtol=1e-5)
+torch.testing.assert_close(bw, sv[..., 3:], atol=2e-5, rtol=1e-5)
 # open-loop reference playback via joint targets
 rs = []
 for t in range(150):
     f1 = env.f + 1
     a = (motion.q[f1] - env.default_q) / env.alpha
     out = env.step(a)
+    assert torch.isfinite(out["s1"]).all() and torch.isfinite(out["r"]).all()
     rs.append(out["r"].mean().item() / 0.1)
     if t % 25 == 0:
         print(t, "norm reward", rs[-1], "term frac", env.failed_eval.float().mean().item(), "e_body_pos", out["terms"]["e_body_pos"].mean().item())
