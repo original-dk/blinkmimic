@@ -30,6 +30,7 @@ motion = MotionLib.from_dir(robot.motion_dir, robot, kin, dev)
 layout = XiLayout(robot, dev)
 mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), layout.dim, robot.sensing)
 env = TrackingSim(make_sim(robot), 3, robot, motion, mdp, dev, reset_noise=False, bin_fix=True)
+assert env.sim_substeps == 1, "stateful filters must update on every physics substep"
 r, ent = env.randomizer, env.robot
 ids = torch.tensor([1], device=dev)
 old_xi = env.xi.clone()

@@ -136,6 +136,27 @@ These smoke runs check collection, model/policy/critic updates and checkpointing
 convergence or GPU performance. Mesh downloads may redirect to `us.aws.cdn.hf.co`; allow that destination alongside
 `huggingface.co` when using the data downloader.
 
+For simulator-wrapper timings on your GPU, stop other GPU jobs and run the two commands separately:
+
+```bash
+uv run --locked python tools/bench_env.py --device cuda:0 --num_envs 4096 --separate_substeps
+uv run --locked python tools/bench_env.py --device cuda:0 --num_envs 4096
+```
+
+The benchmark warms up kernels and synchronizes CUDA around each measured block; it reports median state-read,
+reset-write and control-step times. Compare `legacy_control_step_ms` in the first run with `packed_control_step_ms`
+in the second. Neural updates, training resets and evaluation probes are outside this benchmark, so these timings
+do not establish end-to-end training speed. Rollout/state equivalence checks run before reporting results.
+Stateless G1 runs now group four 5 ms physics substeps into one Genesis scene step. Stateful sensors keep the four
+separate calls so filters still update every 5 ms. State reads and reset writes are packed, and visualization updates
+are disabled. Solver settings, PD gains and rewards are unchanged by these wrapper optimizations.
+
+When comparing training quality with mjlab, use the same seeds, motions and evaluation protocol over multiple runs.
+Genesis currently uses its default `approximate_implicitfast` integrator and contact settings; the historical mjlab
+recipe explicitly used `implicitfast` and a `1e-6` solver tolerance. Matching the robot asset and reward alone does
+not make the dynamics equivalent. Training `sim_r` / episode statistics are also affected by adaptive resets; evaluate
+checkpoints to compare tracking quality. GPU throughput and converged returns must be measured on the target GPU.
+
 For the full GPU recipe:
 
 ```bash

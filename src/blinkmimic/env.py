@@ -28,6 +28,7 @@ PHYSICS_DT = CONTROL_DT / DECIMATION
 class SimulationCfg:
     dt: float = PHYSICS_DT
     iterations: int = 100
+    batch_substeps: bool = True
 
 
 def make_sim(robot: RobotSpec) -> SimulationCfg:
@@ -64,8 +65,11 @@ class TrackingSim:
         requested = torch.device(device)
         if requested.type != gs.device.type or (requested.index is not None and requested.index != gs.device.index):
             raise ValueError(f"Genesis is initialized on {gs.device}, requested {device}")
+        # Stateless policies hold the same target for all four physics substeps. Let Genesis own that loop;
+        # sensor filters still need a Python callback at each substep and keep the original stepping schedule.
+        self.sim_substeps = DECIMATION if sim_cfg.batch_substeps and not robot.sensing.stateful else 1
         self.scene = gs.Scene(
-            sim_options=gs.options.SimOptions(dt=sim_cfg.dt),
+            sim_options=gs.options.SimOptions(dt=sim_cfg.dt * self.sim_substeps, substeps=self.sim_substeps),
             rigid_options=gs.options.RigidOptions(enable_self_collision=False, iterations=sim_cfg.iterations,
                                                  batch_links_info=True, batch_dofs_info=True),
             show_viewer=False,
@@ -78,6 +82,8 @@ class TrackingSim:
         self.q_ids = [self.robot.get_joint(n).qs_idx_local[0] for n in robot.joint_names]
         root = next(j for j in self.robot.joints if j.type == gs.JOINT_TYPE.FREE)
         self.root_dofs, self.root_qs = root.dofs_idx_local, root.qs_idx_local
+        self.state_q_ids = self.root_qs + self.q_ids
+        self.state_dof_ids = self.root_dofs + self.dof_ids
         self.root_link = self.robot.get_link(robot.tracked_bodies[0]).idx_local
         t = lambda values: torch.tensor(values, device=device, dtype=torch.float32)  # noqa: E731
         self.kp = t([d.stiffness for d in robot.drives])
@@ -148,19 +154,20 @@ class TrackingSim:
 
     # ------------------------------------------------------------------ state
     def state(self):
-        p = self.robot.get_links_pos([self.root_link])[:, 0]
-        R = quat_to_mat(self.robot.get_links_quat([self.root_link])[:, 0])
-        v = self.robot.get_links_vel([self.root_link])[:, 0]
-        w = self.robot.get_links_ang([self.root_link])[:, 0]
-        return (p, R, v, w, self.robot.get_dofs_position(self.dof_ids), self.robot.get_dofs_velocity(self.dof_ids))
+        # Two packed reads avoid four link getters and their derived-state refreshes. The copies returned by
+        # Genesis remain valid after the next simulator step (transitions keep both s and s1).
+        qpos = self.robot.get_qpos(self.state_q_ids)
+        qvel = self.robot.get_dofs_velocity(self.state_dof_ids)
+        R = quat_to_mat(qpos[:, 3:7])
+        w = (R @ qvel[:, 3:6].unsqueeze(-1)).squeeze(-1)
+        return (qpos[:, :3], R, qvel[:, :3], w, qpos[:, 7:], qvel[:, 6:])
 
     def _write_state(self, env_ids, p, R, v, w, q, qd):
         # Free-joint linear velocity is world-frame; angular velocity is root-local.
-        self.robot.set_qpos(torch.cat((p, mat_to_quat(R)), -1), self.root_qs, env_ids, zero_velocity=False)
-        self.robot.set_qpos(q, self.q_ids, env_ids, zero_velocity=False)
+        qpos = torch.cat((p, mat_to_quat(R), q), -1)
+        self.robot.set_qpos(qpos, self.state_q_ids, env_ids, zero_velocity=False)
         w_local = (R.transpose(-1, -2) @ w.unsqueeze(-1)).squeeze(-1)
-        self.robot.set_dofs_velocity(torch.cat((v, w_local), -1), self.root_dofs, env_ids)
-        self.robot.set_dofs_velocity(qd, self.dof_ids, env_ids)
+        self.robot.set_dofs_velocity(torch.cat((v, w_local, qd), -1), self.state_dof_ids, env_ids)
         self.robot.control_dofs_position(q, self.dof_ids, env_ids)
 
     # ------------------------------------------------------------------ reset
@@ -332,8 +339,8 @@ class TrackingSim:
         ep_step = self.ep_step.clone()
         target = self.default_q + xi[:, 1 : 1 + self.J] + self.alpha * a
         self.robot.control_dofs_position(target, self.dof_ids)
-        for _ in range(DECIMATION):
-            self.scene.step()
+        for _ in range(DECIMATION // self.sim_substeps):
+            self.scene.step(update_visualizer=False)
             if self.pipe.stateful:
                 gyro, accel = self._imu_site() if self.spec.sensing.imu is not None else (None, None)
                 self._obs_state = self.pipe.filter_update(self._obs_state, self.robot.get_dofs_velocity(self.dof_ids), gyro, accel, self.xi,
