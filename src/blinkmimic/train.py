@@ -116,7 +116,13 @@ parser.add_argument("--resume", type=str, default=None)
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 parser.add_argument("--device", type=str, default="cuda:0", help="torch / Genesis device (cpu for small smoke runs)")
 parser.add_argument("--eager", action="store_true", help="disable torch.compile for debugging and small CPU runs")
+parser.add_argument("--profile_start", type=int, default=2000, help="first zero-based iteration of the timing window")
+parser.add_argument("--profile_steps", type=int, default=0, help="opt-in synchronized phase timings; 0 disables all timing synchronization")
 args = parser.parse_args()
+if args.profile_start < 0 or args.profile_steps < 0:
+    parser.error("--profile_start and --profile_steps must be nonnegative")
+if args.profile_steps and args.profile_start >= args.iterations:
+    parser.error("--profile_start must be smaller than --iterations when profiling is enabled")
 if args.collect_graph or args.eprobe_graph or args.eprobe_async:
     parser.error("Genesis collection / evaluation uses eager stepping; omit --collect_graph, --eprobe_graph and --eprobe_async")
 if args.reset_masked:
@@ -139,6 +145,7 @@ from blinkmimic.networks import Critic, Policy, WorldModel, check_pruned, policy
 from blinkmimic.mirror import Mirror
 from blinkmimic.objective import actor_objective
 from blinkmimic.mdp import flatten_state
+from blinkmimic.profiling import TrainingTimer
 from blinkmimic.robot import get_robot
 from blinkmimic.sensing import ObsPipeline
 
@@ -686,7 +693,9 @@ if RESUME_CTRL is not None:
     print(f"--resume: LR trigger at {DECAY_AT[0]}, focus {'set' if RESUME_CTRL.get('focus_q') is not None else 'none'}", flush=True)
 
 
+timer = TrainingTimer(os.path.join(args.log_dir, "phase_times.csv"), dev, args.profile_start, args.profile_steps)
 for it in range(start_it, args.iterations):
+    timer.begin(it)
     lr = lr_at(it)
     pi_mult = args.pi_lr_mult  # --lr_decay_ret: ramps to 1 after the trigger
     if DECAY_AT[0] is not None:
@@ -700,22 +709,29 @@ for it in range(start_it, args.iterations):
     step_acc += 1.0 / args.utd
     n = int(step_acc)
     step_acc -= n
-    if EPROBE and it >= args.eprobe_start and it % args.eprobe_every == 0:
+    probe_due = EPROBE and it >= args.eprobe_start and it % args.eprobe_every == 0
+    timer.mark("schedule_ms")
+    if probe_due:
         eprobe_burst(it)
+    timer.mark("probe_ms")
     collect(n, stats)
+    timer.mark("collect_ms")
     for _ in range(args.wm_batches):
         l, e8 = wm_update_g()
+    timer.mark("world_model_ms")
     agg["wm"].append(l), agg["wm8"].append(e8)
     if POLICY_START is None and it + 1 >= args.wm_only_iters:
         POLICY_START = args.wm_only_iters
         print(f"policy updates start at iteration {POLICY_START}", flush=True)
         open(os.path.join(args.log_dir, "policy_start.txt"), "w").write(f"{POLICY_START}\n")
-    if POLICY_START is not None and it >= POLICY_START:
+    policy_due = POLICY_START is not None and it >= POLICY_START
+    if policy_due:
         n_avg0 = int(pi_avg.n_averaged) if pi_avg is not None else 0
         pl, vl, ir, gn, surv = policy_update_g()
         if GRAPH and pi_avg is not None and int(pi_avg.n_averaged) == n_avg0:
             pi_avg.n_averaged += 1  # ema_update (and a graph replay) does not advance the host-side counter
         agg["pi"].append(pl), agg["v"].append(vl), agg["ir"].append(ir), agg["gn"].append(gn), agg["surv"].append(surv)
+    timer.mark("policy_critic_ms")
     if (it + 1) % args.log_every == 0:
         mean = lambda x: float(sum(float(v) for v in x) / max(len(x), 1))  # noqa: E731
         mean_nn = lambda x: mean([v for v in (float(v) for v in x) if v == v])  # noqa: E731  (--reset_masked: NaN = no end)
@@ -737,6 +753,7 @@ for it in range(start_it, args.iterations):
               f"| sim_r {row[10]:.3f} ep_len {row[11]:.1f} ep_ret {row[12]:.3f} term {term_frac:.2f} | {ips:.2f} it/s", flush=True)  # fmt: skip
         stats = {k: [] for k in stats}
         agg = {k: [] for k in agg}
+    timer.mark("logging_ms")
     wall = time.time() - t_start
     out_of_time = args.max_hours is not None and wall >= args.max_hours * 3600
     timed = args.ckpt_minutes > 0 and wall >= next_ckpt_s
@@ -768,9 +785,15 @@ for it in range(start_it, args.iterations):
         path = os.path.join(args.log_dir, f"ckpt_{it + 1:06d}.pt")
         torch.save(small, path + ".tmp")
         os.replace(path + ".tmp", path)
+    timer.mark("checkpoint_ms")
+    checkpoint_due = (it + 1) % args.ckpt_every == 0 or final_ck or timed
+    timer.finish(collect_steps=n, world_model_updates=args.wm_batches, policy_updates=int(policy_due),
+                 probe_sweeps=int(probe_due), checkpoint_submissions=int(checkpoint_due))
     if out_of_time:
         print(f"time budget of {args.max_hours} h reached at it {it + 1}", flush=True)
         break
 if CKPT_POOL is not None:  # every background checkpoint written (a failed write raises here: non-zero exit)
     ckpt_wait(drain=True)
     CKPT_POOL.shutdown()
+
+timer.close()

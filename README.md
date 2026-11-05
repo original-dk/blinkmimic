@@ -151,6 +151,24 @@ Stateless G1 runs now group four 5 ms physics substeps into one Genesis scene st
 separate calls so filters still update every 5 ms. State reads and reset writes are packed, and visualization updates
 are disabled. Solver settings, PD gains and rewards are unchanged by these wrapper optimizations.
 
+For end-to-end phase attribution, use a new run directory and sample a steady-state window that includes probe
+sweeps (the main preset probes every 125 iterations). For example:
+
+```bash
+bash scripts/train.sh logs/genesis_profile_s0 --seed 0 --iterations 2250 --profile_start 2000 --profile_steps 250
+```
+
+`phase_times.csv` records synchronized wall times for scheduling, probe sweeps, collection, world-model updates,
+policy/critic updates, logging and checkpoint staging/submission. Counts record the number of control steps,
+updates, sweeps and checkpoint submissions in each row. Iteration labels are one-based; `--profile_start` is
+zero-based, so this example samples iterations 2001–2250. Initial loading and replay-buffer warmup are excluded.
+The checkpoint column includes staging, submission and queue backpressure, but does not charge a background write's
+full lifetime or the final queue drain to that iteration. CSV writing itself is outside the measured phases.
+CUDA synchronizes at phase boundaries only in the selected window; `--profile_steps 0` (default) adds no timing
+synchronization. Profiling changes scheduling, so use it to attribute costs, not to report production `it/s`.
+The Genesis eager collection and synchronous probe sweeps differ from the original mjlab capture/async recipe;
+measure their contribution before changing solver parameters or learning hyperparameters.
+
 When comparing training quality with mjlab, use the same seeds, motions and evaluation protocol over multiple runs.
 Genesis currently uses its default `approximate_implicitfast` integrator and contact settings; the historical mjlab
 recipe explicitly used `implicitfast` and a `1e-6` solver tolerance. Matching the robot asset and reward alone does
