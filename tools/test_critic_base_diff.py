@@ -44,7 +44,7 @@ class CriticBaseDiffTest(unittest.TestCase):
         S[0] = S[0] + .1
         S[2], S[3] = S[2] + .2, S[3] - .3
         features = self.mdp.critic_features(S, self.f, self.xi, self.init, self.f0)
-        offset = 3 * self.mdp.num_j + 3 * len(self.mdp.kin.tracked_idx)
+        offset = 3 * self.mdp.num_j + 12 * len(self.mdp.kin.tracked_idx)
         expected = torch.cat(self.mdp.base_diff(S, self.f, self.init, self.f0), -1)
         torch.testing.assert_close(features[:, offset:offset+12], expected, atol=0, rtol=0)
         self.assertEqual(features.shape, (2, self.mdp.critic_dim))

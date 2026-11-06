@@ -63,7 +63,7 @@ class RelativeRewardTest(unittest.TestCase):
 
     def test_relative_pose_and_local_velocities(self):
         _, e = self.reward(self.transformed(self.f))
-        for k in ("e_root_pos", "e_root_ori", "e_body_linvel", "e_body_angvel"):
+        for k in ("e_root_pos", "e_root_ori", "e_root_linvel", "e_root_angvel"):
             torch.testing.assert_close(e[k], torch.zeros(2), atol=3e-6, rtol=0)
         _, absolute = self.mdp.reward(self.transformed(self.f), self.f, self.a, self.a, terms=True)
         self.assertTrue((absolute['e_root_pos'] > 1).all())

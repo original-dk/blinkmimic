@@ -12,7 +12,7 @@ import torch
 
 from .kinematics import Kinematics
 from .motion import CONTROL_DT, MotionLib
-from .rotations import mat_to_6d, mm3, mv3, quat_to_mat, mat_to_quat, rot_angle_sq, yaw_mat
+from .rotations import mat_to_6d, mm3, mv3, quat_to_mat, mat_to_quat, so3_log, yaw_mat
 from .sensing import SensingCfg, obs_noise
 
 
@@ -96,7 +96,7 @@ class MDP:
         J = default_q.shape[0]
         self.num_j = J
         self.obs_dim, self.xi_dim = obs_dim(J), xi_dim
-        self.critic_dim = 3 * J + len(kin.tracked_idx) * 3 + 12 + self.xi_dim
+        self.critic_dim = 3 * J + len(kin.tracked_idx) * 12 + 12 + self.xi_dim
         self.obs_noise = obs_noise(sensing, J).to(dev)
         self.obs_scale = obs_scale(J).to(dev)
         # InstantTrack contact reward (training only): tracked-body indices of the feet, set by the trainer
@@ -144,6 +144,42 @@ class MDP:
         diff_av = mv3(rRt, m.root_w[f]) - mv3(Rt, w)
         return diff_pos, diff_rot, diff_lv, diff_av
 
+    def hybrid_root(self, R, f):
+        """Robot's current yaw with the reference's current roll/pitch; not a reset-frame transform."""
+        rR = self.motion.root_R[f]
+
+        def heading(A):
+            x, y = A[..., 0, 0], A[..., 1, 0]
+            valid = x.square() + y.square() > 1e-12
+            # At a vertical forward axis yaw is undefined: use zero, keeping a valid rotation and finite gradients.
+            return torch.atan2(torch.where(valid, y, 0.0), torch.where(valid, x, 1.0))
+
+        delta = heading(R) - heading(rR)
+        c, s = delta.cos(), delta.sin()
+        z, one = torch.zeros_like(c), torch.ones_like(c)
+        Y = torch.stack((c, -s, z, s, c, z, z, z, one), -1).reshape(R.shape)
+        return mm3(Y, rR)
+
+    def body_diff(self, S, f, body_state=None):
+        """Link diffs in reference-root / hybrid-root frames, with rotation as a shortest-path 3D rotvec.
+
+        Subtract each own root for positions. Velocities are full link world velocities rotated into
+        those frames; do not subtract base velocity. ``body_state`` reuses FK when reward needs contacts.
+        All four outputs have shape (..., tracked_links, 3).
+        """
+        p, R = S[:2]
+        bp, bR, bv, bw = self.kin.forward(*S) if body_state is None else body_state
+        m = self.motion
+        rp, rR = m.root_p[f], m.root_R[f]
+        rRt = rR.transpose(-1, -2).unsqueeze(-3)
+        Ht = self.hybrid_root(R, f).transpose(-1, -2).unsqueeze(-3)
+        diff_pos = mv3(rRt, m.body_p[f] - rp.unsqueeze(-2)) - mv3(Ht, bp - p.unsqueeze(-2))
+        ref_local_R, local_R = mm3(rRt, m.body_R[f]), mm3(Ht, bR)
+        diff_rot = so3_log(mm3(local_R.transpose(-1, -2), ref_local_R))
+        diff_lv = mv3(rRt, m.body_v[f]) - mv3(Ht, bv)
+        diff_av = mv3(rRt, m.body_w[f]) - mv3(Ht, bw)
+        return diff_pos, diff_rot, diff_lv, diff_av
+
     def reward(self, S, f, a, a_prev, terms: bool = False, w_contact: float = 0.0,
                init_root=None, init_f=None):
         """Per-step reward (already multiplied by dt) comparing S with reference frame f.
@@ -158,19 +194,14 @@ class MDP:
         the reference foot is down. Evaluation keeps ``w_contact = 0``."""
         c, m = self.cfg, self.motion
         p, R, v, w, q, qd = S
-        bp, bR, bv, bw = self.kin.forward(p, R, v, w, q, qd)
-        rp, rR = m.root_p[f], m.root_R[f]
-        # reference bodies re-anchored to the robot's root (xy + yaw), as in BeyondMimic
-        dR = yaw_mat(mm3(R, rR.transpose(-1, -2)))
-        anchor = torch.cat((p[..., :2], rp[..., 2:3]), -1)
-        ref_bp = anchor.unsqueeze(-2) + mv3(dR.unsqueeze(-3), m.body_p[f] - rp.unsqueeze(-2))
-        ref_bR = mm3(dR.unsqueeze(-3), m.body_R[f])
-        e_pos = ((ref_bp - bp) ** 2).sum(-1).mean(-1)
-        e_ori = rot_angle_sq(ref_bR, bR).mean(-1)
-        # Velocities in the current root frames, matching the base-velocity convention of the reference.
-        Rt, rRt = R.transpose(-1, -2).unsqueeze(-3), rR.transpose(-1, -2).unsqueeze(-3)
-        e_lv = ((mv3(rRt, m.body_v[f]) - mv3(Rt, bv)) ** 2).sum(-1).mean(-1)
-        e_av = ((mv3(rRt, m.body_w[f]) - mv3(Rt, bw)) ** 2).sum(-1).mean(-1)
+        body_state = self.kin.forward(p, R, v, w, q, qd)
+        bp, bR, bv, bw = body_state
+        diff_pos, diff_rot, diff_lv, diff_av = self.body_diff(S, f, body_state)
+        # Mean squared vector norm over links: std is per-link distance / angle / speed, independent of link count.
+        e_pos = (diff_pos ** 2).sum(-1).mean(-1)
+        e_ori = (diff_rot ** 2).sum(-1).mean(-1)
+        e_lv = (diff_lv ** 2).sum(-1).mean(-1)
+        e_av = (diff_av ** 2).sum(-1).mean(-1)
         diff_rp, diff_ro, diff_rlv, diff_rav = self.base_diff(S, f, init_root, init_f)
         e_rp = (diff_rp ** 2).sum(-1)
         e_ro = (diff_ro ** 2).sum(-1)
@@ -230,21 +261,14 @@ class MDP:
         return 1 - alive
 
     def critic_features(self, S, f, xi, init_root, init_f) -> torch.Tensor:
-        """Joints, body error, the reward's four base diffs, and sim context (goal appended by trainer).
+        """Joints, body diffs, the reward's four base diffs, and sim context (goal appended by trainer).
 
         Base height, tilt, raw local velocities and absolute root pose errors are replaced by the
-        same 12 base-diff components used by reward. Reset context is required for every sample.
+        same 12 base-diff components used by reward. Body inputs are the four shared link diffs.
+        Reset context is required for every sample.
         """
         assert init_root is not None and init_f is not None, "critic needs each sample's reset pose and expert frame"
-        m = self.motion
-        p, R, v, w, q, qd = S
-        H = yaw_mat(R)
-        Ht = H.transpose(-1, -2)
-        rp, rR = m.root_p[f], m.root_R[f]
-        bp = self.kin.forward(p, R, v, w, q, qd)[0]
-        dR = yaw_mat(mm3(R, rR.transpose(-1, -2)))
-        anchor = torch.cat((p[..., :2], rp[..., 2:3]), -1)
-        ref_bp = anchor.unsqueeze(-2) + mv3(dR.unsqueeze(-3), m.body_p[f] - rp.unsqueeze(-2))
-        e_body = mv3(Ht.unsqueeze(-3), ref_bp - bp).flatten(-2)
-        diff_pos, diff_rot, diff_lv, diff_av = self.base_diff(S, f, init_root, init_f)
-        return torch.cat((q, qd, m.q[f] - q, e_body, diff_pos, diff_rot, diff_lv, diff_av, xi), -1)
+        q, qd = S[4:]
+        body = tuple(x.flatten(-2) for x in self.body_diff(S, f))
+        base = self.base_diff(S, f, init_root, init_f)
+        return torch.cat((q, qd, self.motion.q[f] - q, *body, *base, xi), -1)

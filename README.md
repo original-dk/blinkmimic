@@ -154,6 +154,20 @@ sample's reset context. Actor observations, motion commands and world-model inpu
 layouts. This changes the critic input dimension: start a new training run rather than resuming an older
 `last.pt` with the previous critic layout. Existing policy-only checkpoints remain usable for evaluation.
 
+Body rewards and critic features share four link diffs, each with shape `(batch, links, 3)`. The reference
+uses its current base frame; the robot uses a hybrid frame with its own current yaw and the reference's
+current roll/pitch. Positions subtract each own base position. Linear/angular velocities are rotated into
+those frames without subtracting base velocity. Rotation is a shortest-path 3D rotation vector of
+`inverse(robot_local_quat) * reference_local_quat`, in radians.
+
+Each body reward is `exp(-mean_links(sum_xyz(diff**2)) / std**2)`. This averages squared vector norms over
+links, so the denominator does not scale with link count. Defaults remain `body_pos_std=0.3` meters,
+`body_ori_std=0.4` radians, `body_linvel_std=1.0` m/s and `body_angvel_std=3.14` rad/s; an error equal to its std
+on every link gives reward `exp(-1)`. These are std parameters, equivalent to `sigma=std**2` in a direct
+sigma denominator. The critic now receives all four flattened body diffs instead of the old body position
+error only; its input dimension changes again, so use a new training run. At a vertical forward axis, where
+yaw is undefined, hybrid construction uses a zero heading rather than a degenerate rotation.
+
 ### 2. Evaluate and record multiple random episodes
 
 ```bash

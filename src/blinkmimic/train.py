@@ -241,7 +241,7 @@ if args.resume:
     ck = torch.load(args.resume, map_location=dev, weights_only=False)
     assert "opt_pi" in ck, f"--resume {args.resume}: no optimizer state (use last.pt)"
     if ck["critic"]["net.0.weight"].shape[1] != CRITIC_IN:
-        raise ValueError("--resume critic input layout differs (base diffs replaced the old base observations); start a new run")
+        raise ValueError("--resume critic input layout differs (base/body diffs replaced the old observations); start a new run")
     check_pruned(ck.get("args", {}), what=args.resume)
     wm.load_state_dict(ck["wm"]), pi.load_state_dict(ck.get("pi_live", ck["pi"])), critic.load_state_dict(ck["critic"])
     load_opt_states(ck)
