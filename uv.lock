@@ -1045,6 +1045,7 @@ dependencies = [
     { name = "mjlab" },
     { name = "pillow", version = "12.3.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "pillow", version = "13.0.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "tensorboard" },
     { name = "torch" },
 ]
 
@@ -1053,6 +1054,7 @@ requires-dist = [
     { name = "matplotlib" },
     { name = "mjlab", specifier = ">=1.6.0" },
     { name = "pillow" },
+    { name = "tensorboard" },
     { name = "torch", specifier = ">=2.7.0", index = "https://download.pytorch.org/whl/cu128" },
 ]
 

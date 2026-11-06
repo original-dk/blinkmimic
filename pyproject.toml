@@ -16,6 +16,7 @@ dependencies = [
   "torch>=2.7.0",
   "matplotlib",
   "pillow",
+  "tensorboard",
 ]
 
 [tool.uv]

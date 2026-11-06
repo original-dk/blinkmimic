@@ -197,20 +197,24 @@ class MDP:
         n_links = diff_pos.shape[-2]
         # Keep diagnostic errors as mean per-link vector norms. Reward sigma follows the reference
         # directly: pos/rot sum all link components; velocities average all components (including xyz).
-        r_track = (
-            c.w_link_pos * torch.exp(-e_pos * n_links / c.sigma_link_pos)
-            + c.w_link_rotation * torch.exp(-e_ori * n_links / c.sigma_link_rotation)
-            + c.w_link_lin_vel * torch.exp(-e_lv / (3 * c.sigma_link_lin_vel))
-            + c.w_link_ang_vel * torch.exp(-e_av / (3 * c.sigma_link_ang_vel))
-            + c.w_base_pos * torch.exp(-e_rp / c.sigma_base_pos)
-            + c.w_base_rotation * torch.exp(-e_ro / c.sigma_base_rotation)
-            + c.w_base_lin_vel * torch.exp(-e_rlv / c.sigma_base_lin_vel)
-            + c.w_base_ang_vel * torch.exp(-e_rav / c.sigma_base_ang_vel)
-            + c.w_dofs_vel * torch.exp(-e_jv / c.sigma_dofs_vel)
+        scores = dict(
+            link_pos=torch.exp(-e_pos * n_links / c.sigma_link_pos),
+            link_rotation=torch.exp(-e_ori * n_links / c.sigma_link_rotation),
+            link_lin_vel=torch.exp(-e_lv / (3 * c.sigma_link_lin_vel)),
+            link_ang_vel=torch.exp(-e_av / (3 * c.sigma_link_ang_vel)),
+            base_pos=torch.exp(-e_rp / c.sigma_base_pos),
+            base_rotation=torch.exp(-e_ro / c.sigma_base_rotation),
+            base_lin_vel=torch.exp(-e_rlv / c.sigma_base_lin_vel),
+            base_ang_vel=torch.exp(-e_rav / c.sigma_base_ang_vel),
+            dofs_vel=torch.exp(-e_jv / c.sigma_dofs_vel),
         )
+        rewards = {name: getattr(c, "w_" + name) * score for name, score in scores.items()}
+        r_track = sum(rewards.values())
         r_rate = ((a - a_prev) ** 2).sum(-1)
         r_mag = (a ** 2).sum(-1)
         r_lim = (torch.relu(q - self.soft_hi) + torch.relu(self.soft_lo - q)).sum(-1)
+        rewards.update(action_rate=c.w_action_rate * r_rate, action_magnitude=c.w_action_magnitude * r_mag,
+                       joint_limit=c.w_joint_limit * r_lim, contact=torch.zeros_like(r_track))
         r = (r_track + c.w_action_rate * r_rate + c.w_action_magnitude * r_mag + c.w_joint_limit * r_lim) * CONTROL_DT
         if w_contact > 0:
             fz, rz = bp[..., self.feet, 2], m.body_p[f][..., self.feet, 2]
@@ -219,7 +223,8 @@ class MDP:
             c_ref = rc[f] if rc is not None else (rz < CONTACT_Z).float()
             slip = (bv[..., self.feet, :2] ** 2).sum(-1)
             r_contact = (1 - (c_sim - c_ref) ** 2) + c_ref * torch.exp(-slip / 0.3**2)
-            r = r + w_contact * r_contact.mean(-1) * CONTROL_DT
+            rewards["contact"] = w_contact * r_contact.mean(-1)
+            r = r + rewards["contact"] * CONTROL_DT
         if terms:
             return r, {
                 "track": r_track * CONTROL_DT,
@@ -235,6 +240,8 @@ class MDP:
                 "action_rate": r_rate,
                 "action_magnitude": r_mag,
                 "joint_limit": r_lim,
+                **{"r_" + name: value * CONTROL_DT for name, value in rewards.items()},
+                **{"score_" + name: value for name, value in scores.items()},
             }
         return r
 

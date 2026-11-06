@@ -84,14 +84,14 @@ class ReplayBuffer:
         size = self.size_t if self.size_t is not None else self.size
         return (ptr - size + age) % self.T
 
-    def sample_windows(self, B: int, k: int):
+    def sample_windows(self, B: int, k: int, extra: tuple[str, ...] = ()):
         """k-step windows; returns dict of (B, k, ...) tensors and a validity mask (B, k)."""
         t0 = self._randint((self.size_t if self.size_t is not None else self.size) - k + 1, B)
         env = torch.randint(0, self.N, (B,), device=self.device)
         ages = t0.unsqueeze(-1) + torch.arange(k, device=self.device)
         rows = self._row(ages)
         e = env.unsqueeze(-1).expand_as(rows)
-        out = {key: self.data[key][rows, e] for key in ("s", "s1", "a", "a_prev", "xi", "cut")}
+        out = {key: self.data[key][rows, e] for key in ("s", "s1", "a", "a_prev", "xi", "cut") + extra}
         # transition j is valid if the state stayed continuous (no episode end, no push) after 0..j-1
         d = out["cut"].float()
         mask = torch.cumprod(torch.cat((torch.ones(B, 1, device=self.device), 1 - d[:, :-1]), -1), -1)

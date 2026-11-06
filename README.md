@@ -196,6 +196,56 @@ Actor observations and commands, base/body diff definitions and critic layout ar
 reward coefficients. The critic receives all four body diffs and all four base diffs; old critic layouts
 still require a new training run.
 
+### TensorBoard: rewards, tracking errors and world-model accuracy
+
+Training automatically writes events to `<log_dir>/tensorboard` at `--log_every` (default 50 iterations).
+The training command stays the same. After installing/syncing the project dependencies, open the dashboard:
+
+```bash
+tensorboard --logdir logs --port 6006
+```
+
+- `train/*`: the existing CSV metrics, including simulator/imagined returns, world-model loss and throughput.
+- `reward_sim/*`, `reward_model/*`: all nine tracking contributions, action-rate/action-magnitude/joint-limit
+  penalties, contact bonus, tracking subtotal and total. These are **weighted rewards per control step,
+  including CONTROL_DT**, before return normalization. Zero-weight terms remain visible.
+- `score_sim/*`, `score_model/*`: the unweighted tracking exponentials (0 to 1), independent of reward weights.
+  `saturated_*/*` is the fraction with a score below 0.05; a large fraction identifies a nearly flat reward.
+- `diff_sim/*`, `diff_model/*`: RMS base/link position, rotation and velocity errors, plus base XYZ signed biases
+  and the 90th percentile of each base diff norm. Base position is in meters in each reset frame; velocities
+  use the reward's local frames. `base_angle_deg` converts the base quaternion chord to a physical angle;
+  `root_ori_rms`/`base_rotation_p90` retain the actual quaternion-vector diff, not radians. Link rotation is
+  a 3D rotvec in radians. Link RMS errors average links; joint-velocity error sums joints before the RMS.
+- `motion_sim/base_forward_speed`, `motion_model/base_forward_speed`, `motion_reference/base_forward_speed`:
+  compare forward speed in each current base frame when the apparent stride is too small.
+- `wm/loss_group/*`: mean normalized squared error within each state group; `wm/loss_contribution/*` also
+  applies its dimension fraction, and the six contributions sum to `wm/loss`. Normalization floors and masks
+  match training. G1 has 12 base components and 58 joint components, so the aggregate loss alone can hide
+  poor base prediction. The model predicts simulator dynamics, rather than directly learning imitation rewards.
+- `wm/rmse_1step/*`, `wm/rmse_8step/*`, `wm/rmse_32step/*` (default horizons): physical prediction RMSE per
+  component, without training normalization. These distinguish good short predictions from accumulating drift.
+  Actual horizon names follow `--wm_window`/`--horizon`; `wm/valid_*step` records the valid sample counts.
+  An RMSE with no valid samples is NaN rather than a misleading zero.
+
+Diagnostics sample 128 replay windows and replay the **same recorded actions** through the current world
+model without teacher forcing. Simulator/model reward plots use these paired windows, rather than the actor's
+separate imagined training rollout or an average over the logging interval. Reset/push crossings are masked;
+terminal transitions themselves remain valid. `reward_model/contact` includes the training-only bonus;
+`reward_sim/contact` is zero. `wm/reward_gap_without_contact` subtracts that bonus for a fair comparison:
+a positive gap means the model scores these actions more favorably than the simulator does.
+Sampling restores the training RNG state, does not update normalizers/optimizers, and runs outside CUDA graphs
+only at logging intervals. The dashboard also stores the active reward configuration and arguments as text.
+
+For sigma tuning, first inspect `score_sim/base_pos`, `score_sim/base_rotation` and their saturated fractions.
+If most samples have already fallen below 0.05, try a broader denominator before raising weights again:
+`sigma_base_pos=0.5**2` (previously `0.3**2`) and `sigma_base_rotation=0.6**2` (previously `0.4**2`) are a
+starting comparison, keeping weights fixed. At 0.6 m error the position exponential rises from 0.018 to 0.237;
+at 60 degrees the rotation exponential rises from 0.0019 to 0.062. This restores gradients farther from the
+target but makes close tracking less strict; tighten sigma once tracking improves. If scores are already high
+despite unacceptable error, use a smaller sigma instead. For a representative squared error E and desired
+score r, the denominator is `sigma = -E / log(r)`; base rotation uses `E = 4*sin(angle/2)**2`.
+These are manual tuning suggestions; logging does not change the active reward configuration.
+
 ### 2. Evaluate and record multiple random episodes
 
 ```bash

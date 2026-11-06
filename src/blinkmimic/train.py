@@ -140,9 +140,11 @@ if args.xy_range is not None and (not all(math.isfinite(x) for x in args.xy_rang
 
 import torch
 import torch.nn as nn
+from torch.utils.tensorboard import SummaryWriter
 
 from blinkmimic.buffer import ReplayBuffer
 from blinkmimic.dr import XiLayout
+from blinkmimic.diagnostics import replay_diagnostics
 from blinkmimic.env import PHYSICS_DT, TrackingSim, make_sim
 from blinkmimic.kinematics import Kinematics
 from blinkmimic.mdp import MAX_STEP_REWARD, MDP, unflatten_state
@@ -884,6 +886,9 @@ def eprobe_finish(it, lead, t0, fail_f):
 
 
 stats = {"r": [], "ep_len": [], "ep_ret": [], "term": [], "done": []}
+writer = SummaryWriter(os.path.join(args.log_dir, "tensorboard"), purge_step=start_it + 1 if start_it else None)
+writer.add_text("config/reward", "```json\n" + json.dumps(dataclasses.asdict(mdp.cfg), indent=2) + "\n```", start_it)
+writer.add_text("config/args", "```json\n" + json.dumps(vars(args), indent=2) + "\n```", start_it)
 collect(args.warmup_steps, stats)  # the replay buffer is not checkpointed, so a resumed run refills it too
 log_path = os.path.join(args.log_dir, "train_log.csv")
 log_f = open(log_path, "a")
@@ -976,6 +981,13 @@ for it in range(start_it, args.iterations):
             why = f"training return {row[12]:.3f} >= {args.lr_decay_ret}" if row[12] >= args.lr_decay_ret else f"deadline --lr_decay_by {args.lr_decay_by}"
             print(f"--lr_decay_ret: {why} at it {it + 1}: policy LR x{args.pi_lr_mult} -> x1 over {args.lr_decay_len} its", flush=True)
         log_f.flush()
+        for name, value in zip(("iteration", "wall_h", "sim_steps", "wm_loss", "wm_err8", "pi_loss", "v_loss",
+                                "imag_rew", "pi_gradnorm", "imag_survival", "sim_rew", "ep_len", "ep_ret_norm",
+                                "term_frac", "it_per_s", "lr", "pi_lr", "pi_mult", "nonfinite"), row + extra):
+            writer.add_scalar("train/" + name, value, it + 1)
+        for name, value in replay_diagnostics(buffer, wm, mdp, normalize_xi, ERR_FLOOR, args.wm_window, HZ).items():
+            writer.add_scalar(name, value, it + 1)
+        writer.flush()
         print(f"it {it + 1} | {wall_h:.3f} h | wm {row[3]:.4f} e8 {row[4]:.4f} | pi {row[5]:.3f} v {row[6]:.4f} imag_r {row[7]:.3f} surv {row[9]:.3f} "
               f"| sim_r {row[10]:.3f} ep_len {row[11]:.1f} ep_ret {row[12]:.3f} term {term_frac:.2f} | {ips:.2f} it/s", flush=True)  # fmt: skip
         stats = {k: [] for k in stats}
@@ -1017,3 +1029,5 @@ for it in range(start_it, args.iterations):
 if CKPT_POOL is not None:  # every background checkpoint written (a failed write raises here: non-zero exit)
     ckpt_wait(drain=True)
     CKPT_POOL.shutdown()
+writer.close()
+log_f.close()
