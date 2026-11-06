@@ -7,7 +7,6 @@ velocity of the root link frame, joint positions and velocities. ``J`` is the nu
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 
 import torch
 
@@ -33,6 +32,7 @@ def obs_scale(J: int) -> torch.Tensor:
 
 
 CONTACT_Z = 0.045  # ankle-roll link origin height below which a foot counts as in contact (as in tools/eval_metrics.py)
+MAX_STEP_REWARD = (4 * 1.0 + 4 * 0.5) * CONTROL_DT
 
 
 @dataclass
@@ -45,55 +45,11 @@ class RewardCfg:
     root_ori_std: float = 0.4
     root_linvel_std: float = 1.0
     root_angvel_std: float = 3.14
-    joint_vel_std: float = math.sqrt(5.0)
-    w_body_pos: float = 1.0
-    w_body_ori: float = 1.0
-    w_body_linvel: float = 1.0
-    w_body_angvel: float = 1.0
-    w_root_pos: float = 0.5
-    w_root_ori: float = 0.5
-    w_root_linvel: float = 0.5
-    w_root_angvel: float = 0.5
-    w_joint_vel: float = 0.0
-    w_action_magnitude: float = 0.0
     w_action_rate: float = -0.1
     w_joint_limit: float = -2.0
     soft_limit_factor: float = 0.9
     term_height: float = 0.25
     term_tilt: float = 0.8
-
-    @property
-    def max_step_reward(self) -> float:
-        """Maximum positive reward per step, excluding the optional training-only contact bonus."""
-        return CONTROL_DT * sum((self.w_body_pos, self.w_body_ori, self.w_body_linvel, self.w_body_angvel,
-                                 self.w_root_pos, self.w_root_ori, self.w_root_linvel, self.w_root_angvel,
-                                 self.w_joint_vel))
-
-    @classmethod
-    def from_preset(cls, name: str, num_links: int):
-        if name == "default":
-            return cls()
-        if name != "reference" or num_links < 1:
-            raise ValueError("expected reward preset default/reference and at least one tracked link")
-        # Our body errors average squared vector norms over links. Reference pos/rot sum every
-        # component, while reference velocities average every component (including xyz).
-        return cls(root_pos_std=math.sqrt(0.1), root_ori_std=math.sqrt(0.1),
-                   root_linvel_std=math.sqrt(2.0), root_angvel_std=math.sqrt(2.0),
-                   body_pos_std=math.sqrt(0.5 / num_links), body_ori_std=math.sqrt(1.0 / num_links),
-                   body_linvel_std=math.sqrt(3.0), body_angvel_std=math.sqrt(6.0),
-                   joint_vel_std=math.sqrt(5.0), w_body_pos=0.5, w_body_ori=0.6,
-                   w_body_linvel=0.2, w_body_angvel=0.2, w_root_pos=0.5, w_root_ori=0.5,
-                   w_root_linvel=0.2, w_root_angvel=0.2, w_joint_vel=0.1,
-                   w_action_rate=-0.01, w_action_magnitude=-0.01, w_joint_limit=0.0)
-
-    @classmethod
-    def from_args(cls, args: dict, num_links: int):
-        """Checkpoint's resolved config takes precedence; old checkpoints use the default preset."""
-        cfg = args.get("reward_cfg")
-        return cls(**cfg) if cfg is not None else cls.from_preset(args.get("reward_preset", "default"), num_links)
-
-
-MAX_STEP_REWARD = RewardCfg().max_step_reward  # default-preset compatibility; runtime uses mdp.max_step_reward
 
 
 def flatten_state(S) -> torch.Tensor:
@@ -132,9 +88,10 @@ def inv_dim(J: int) -> int:
 class MDP:
     def __init__(self, kin: Kinematics, motion: MotionLib, default_q: torch.Tensor, xi_dim: int,
                  sensing: SensingCfg = SensingCfg(), cfg: RewardCfg = RewardCfg()):  # fmt: skip
-        self.kin, self.motion = kin, motion
-        self.set_reward_cfg(cfg)
+        self.kin, self.motion, self.cfg = kin, motion, cfg
         self.default_q = default_q
+        mid, half = (kin.q_lo + kin.q_hi) / 2, (kin.q_hi - kin.q_lo) / 2
+        self.soft_lo, self.soft_hi = mid - half * cfg.soft_limit_factor, mid + half * cfg.soft_limit_factor
         dev = default_q.device
         J = default_q.shape[0]
         self.num_j = J
@@ -144,16 +101,6 @@ class MDP:
         self.obs_scale = obs_scale(J).to(dev)
         # InstantTrack contact reward (training only): tracked-body indices of the feet, set by the trainer
         self.feet: list[int] = []
-
-    def set_reward_cfg(self, cfg: RewardCfg):
-        """Set a checkpoint's reward config before evaluation or CUDA graph capture."""
-        self.cfg = cfg
-        mid, half = (self.kin.q_lo + self.kin.q_hi) / 2, (self.kin.q_hi - self.kin.q_lo) / 2
-        self.soft_lo, self.soft_hi = mid - half * cfg.soft_limit_factor, mid + half * cfg.soft_limit_factor
-
-    @property
-    def max_step_reward(self) -> float:
-        return self.cfg.max_step_reward
 
     # ---------------- observation ----------------
     def obs(self, S, a_prev, xi, f) -> torch.Tensor:
@@ -260,22 +207,19 @@ class MDP:
         e_ro = (diff_ro ** 2).sum(-1)
         e_rlv = (diff_rlv ** 2).sum(-1)
         e_rav = (diff_rav ** 2).sum(-1)
-        e_jv = ((m.qd[f] - qd) ** 2).sum(-1)
         r_track = (
-            c.w_body_pos * torch.exp(-e_pos / c.body_pos_std**2)
-            + c.w_body_ori * torch.exp(-e_ori / c.body_ori_std**2)
-            + c.w_body_linvel * torch.exp(-e_lv / c.body_linvel_std**2)
-            + c.w_body_angvel * torch.exp(-e_av / c.body_angvel_std**2)
-            + c.w_root_pos * torch.exp(-e_rp / c.root_pos_std**2)
-            + c.w_root_ori * torch.exp(-e_ro / c.root_ori_std**2)
-            + c.w_root_linvel * torch.exp(-e_rlv / c.root_linvel_std**2)
-            + c.w_root_angvel * torch.exp(-e_rav / c.root_angvel_std**2)
-            + c.w_joint_vel * torch.exp(-e_jv / c.joint_vel_std**2)
+            torch.exp(-e_pos / c.body_pos_std**2)
+            + torch.exp(-e_ori / c.body_ori_std**2)
+            + torch.exp(-e_lv / c.body_linvel_std**2)
+            + torch.exp(-e_av / c.body_angvel_std**2)
+            + 0.5 * torch.exp(-e_rp / c.root_pos_std**2)
+            + 0.5 * torch.exp(-e_ro / c.root_ori_std**2)
+            + 0.5 * torch.exp(-e_rlv / c.root_linvel_std**2)
+            + 0.5 * torch.exp(-e_rav / c.root_angvel_std**2)
         )
         r_rate = ((a - a_prev) ** 2).sum(-1)
-        r_mag = (a ** 2).sum(-1)
         r_lim = (torch.relu(q - self.soft_hi) + torch.relu(self.soft_lo - q)).sum(-1)
-        r = (r_track + c.w_action_rate * r_rate + c.w_action_magnitude * r_mag + c.w_joint_limit * r_lim) * CONTROL_DT
+        r = (r_track + c.w_action_rate * r_rate + c.w_joint_limit * r_lim) * CONTROL_DT
         if w_contact > 0:
             fz, rz = bp[..., self.feet, 2], m.body_p[f][..., self.feet, 2]
             c_sim = torch.sigmoid((CONTACT_Z - fz) / 0.005)
@@ -295,9 +239,7 @@ class MDP:
                 "e_root_angvel": e_rav,
                 "e_body_linvel": e_lv,
                 "e_body_angvel": e_av,
-                "e_joint_vel": e_jv,
                 "action_rate": r_rate,
-                "action_magnitude": r_mag,
                 "joint_limit": r_lim,
             }
         return r

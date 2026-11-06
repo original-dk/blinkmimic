@@ -28,7 +28,7 @@ import blinkmimic.networks as networks
 from blinkmimic.dr import XiLayout
 from blinkmimic.env import TrackingSim, make_sim
 from blinkmimic.kinematics import Kinematics
-from blinkmimic.mdp import MDP, RewardCfg
+from blinkmimic.mdp import MAX_STEP_REWARD, MDP
 from blinkmimic.motion import MotionLib
 from blinkmimic.networks import Policy, check_pruned, policy_kwargs
 from blinkmimic.robot import get_robot
@@ -55,10 +55,6 @@ def load_policy(ck):
 
 @torch.no_grad()
 def evaluate_group(env: TrackingSim, cks: list[dict]) -> list[dict]:
-    configs = [RewardCfg.from_args(ck["args"], len(kin.tracked_idx)) for ck in cks]
-    if any(c != configs[0] for c in configs):
-        raise ValueError("batch contains different reward configs; evaluate these runs separately")
-    mdp.set_reward_cfg(configs[0])
     M = len(cks)
     N = env.N
     pis = [load_policy(ck) for ck in cks]
@@ -86,14 +82,14 @@ def evaluate_group(env: TrackingSim, cks: list[dict]) -> list[dict]:
         ret += torch.where(alive, out["r"], 0.0)
         env.f = torch.minimum(env.f, clip_end - 1)  # finished clips keep stepping; keep f+1 in range
     clip_len = motion.clip_len[clip_of]
-    norm = ret / ((clip_len - 1).float() * mdp.max_step_reward)
+    norm = ret / ((clip_len - 1).float() * MAX_STEP_REWARD)
     res = []
     for m in range(M):
         sl = slice(m * C, (m + 1) * C)
         failed = env.failed_eval[sl]
         res.append({
             "norm_return": norm[sl].mean().item(),
-            "norm_return_framew": (ret[sl].sum() / ((clip_len[sl] - 1).sum() * mdp.max_step_reward)).item(),
+            "norm_return_framew": (ret[sl].sum() / ((clip_len[sl] - 1).sum() * MAX_STEP_REWARD)).item(),
             "n_failed": int(failed.sum().item()),
             "failed": [motion.names[i] for i in failed.nonzero().flatten().tolist()],
             "per_clip": {motion.names[i]: round(norm[m * C + i].item(), 4) for i in range(C)},

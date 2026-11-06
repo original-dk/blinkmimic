@@ -129,17 +129,12 @@ parser.add_argument("--motion_dir", type=str, default=None, help="defaults to th
 parser.add_argument("--log_dir", type=str, default=os.path.join(REPO, "logs", "run"))
 parser.add_argument("--yaw_degrees", type=float, default=None,
                     help="additional uniform reset yaw offset half-range in degrees (robot default: 90; 0 disables)")
-parser.add_argument("--reward_preset", choices=["default", "reference"], default="default",
-                    help="reward weights/scales; reference matches the supplied sigma/sum/mean configuration")
 parser.add_argument("--xy_range", type=float, nargs=2, default=None, metavar=("LOW", "HIGH"),
                     help="additional independent reset X/Y translation interval in meters (robot default: 0 0.1)")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--resume", type=str, default=None)
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 args = parser.parse_args()
-if args.reward_preset == "reference" and args.contact_reward != 0:
-    print("--reward_preset reference: disabling the extra contact reward", flush=True)
-    args.contact_reward = 0.0
 if args.yaw_degrees is not None and not 0 <= args.yaw_degrees <= 180:
     parser.error("--yaw_degrees must be between 0 and 180")
 if args.xy_range is not None and (not all(math.isfinite(x) for x in args.xy_range) or args.xy_range[0] > args.xy_range[1]):
@@ -152,7 +147,7 @@ from blinkmimic.buffer import ReplayBuffer
 from blinkmimic.dr import XiLayout
 from blinkmimic.env import PHYSICS_DT, TrackingSim, make_sim
 from blinkmimic.kinematics import Kinematics
-from blinkmimic.mdp import MDP, RewardCfg, unflatten_state
+from blinkmimic.mdp import MAX_STEP_REWARD, MDP, unflatten_state
 from blinkmimic.motion import CONTROL_DT, MotionLib
 import blinkmimic.networks as networks
 import blinkmimic.rotations as rotations
@@ -169,6 +164,7 @@ torch.manual_seed(args.seed)
 networks.AMP_DTYPE = torch.bfloat16 if args.amp == "bf16" else None
 dev = "cuda:0"
 os.makedirs(args.log_dir, exist_ok=True)
+json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent=2)
 
 robot = get_robot(args.robot)
 if args.yaw_degrees is not None or args.xy_range is not None:
@@ -183,10 +179,7 @@ kin = Kinematics(robot, dev)
 motion = MotionLib.from_dir(args.motion_dir or robot.motion_dir, robot, kin, dev)
 layout = XiLayout(robot, dev)
 normalize_xi = layout.normalize
-reward_cfg = RewardCfg.from_preset(args.reward_preset, len(kin.tracked_idx))
-args.reward_cfg = dataclasses.asdict(reward_cfg)
-json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent=2)
-mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), layout.dim, robot.sensing, cfg=reward_cfg)
+mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), layout.dim, robot.sensing)
 pipe = ObsPipeline(robot, mdp, layout, dev, PHYSICS_DT)
 K, Hh, HZ = args.goal_frames, args.hist, args.horizon
 GOAL_DIM = motion.goal_dim(K)
@@ -249,8 +242,6 @@ if args.resume:
     assert "opt_pi" in ck, f"--resume {args.resume}: no optimizer state (use last.pt)"
     if ck["critic"]["net.0.weight"].shape[1] != CRITIC_IN:
         raise ValueError("--resume critic input layout differs (base/body diffs replaced the old observations); start a new run")
-    if RewardCfg.from_args(ck.get("args", {}), len(kin.tracked_idx)) != mdp.cfg:
-        raise ValueError("--resume reward config differs from the checkpoint; use the same --reward_preset or start a new run")
     check_pruned(ck.get("args", {}), what=args.resume)
     wm.load_state_dict(ck["wm"]), pi.load_state_dict(ck.get("pi_live", ck["pi"])), critic.load_state_dict(ck["critic"])
     load_opt_states(ck)
@@ -557,7 +548,7 @@ def policy_update():
             v_loss.backward()
             nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
             opt_v.step()
-    return loss.detach(), v_loss.detach(), (r_sum / HZ / mdp.max_step_reward).mean(), gn.detach(), c.mean().detach()
+    return loss.detach(), v_loss.detach(), (r_sum / HZ / MAX_STEP_REWARD).mean(), gn.detach(), c.mean().detach()
 
 
 # ------------------------------------------------------------------------------------------------
@@ -600,7 +591,7 @@ def _collect_core():
     # the simulator wrapper rebinds these per step: copy them back into the static tensors the graph reads
     CG["f"].copy_(env.f), CG["ep_step"].copy_(env.ep_step), CG["a_prev"].copy_(env.a_prev)
     env.f, env.ep_step, env.a_prev = CG["f"], CG["ep_step"], CG["a_prev"]
-    core = {"done": out["done"], "term": out["term"], "f": out["f"], "r_mean": out["r"].mean() / mdp.max_step_reward}
+    core = {"done": out["done"], "term": out["term"], "f": out["f"], "r_mean": out["r"].mean() / MAX_STEP_REWARD}
     if args.reset_masked:  # the episode ends in the graph too (reset_masked writes f, ep_step, a_prev in place)
         out = env.step_tail_masked(out)
         n = out["n_done"]
@@ -688,7 +679,7 @@ def collect(n_steps: int, stats: dict):
         wm.out_norm.update(wm_out)
         wm.inc_norm.update(wm_inc)
         sim_steps += args.num_envs
-        stats["r"].append(out["r"].mean() / mdp.max_step_reward)
+        stats["r"].append(out["r"].mean() / MAX_STEP_REWARD)
         if "ep_len" in out:
             stats["ep_len"].append(out["ep_len"].mean())
             stats["ep_ret"].append(out["ep_ret_norm"].mean())

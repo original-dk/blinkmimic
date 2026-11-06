@@ -31,7 +31,7 @@ import blinkmimic.networks as networks
 from blinkmimic.dr import XiLayout
 from blinkmimic.env import TrackingSim, make_sim
 from blinkmimic.kinematics import Kinematics
-from blinkmimic.mdp import MDP, RewardCfg
+from blinkmimic.mdp import MAX_STEP_REWARD, MDP
 from blinkmimic.motion import MotionLib
 from blinkmimic.networks import Policy, policy_kwargs
 from blinkmimic.robot import get_robot
@@ -60,7 +60,6 @@ def load_policy(ck):
 
 @torch.no_grad()
 def run(cks):
-    mdp.set_reward_cfg(RewardCfg.from_args(cks[0]["args"], len(kin.tracked_idx)))
     M = len(cks)
     N = C * M
     env = TrackingSim(make_sim(robot), N, robot, motion, mdp, dev, eval_mode=True, randomize=False)
@@ -109,7 +108,7 @@ def run(cks):
         s = {k: v[m * C : (m + 1) * C].sum().item() for k, v in acc.items()}
         n = s["n"]
         res.append({
-            "norm_return": (acc["ret"][m * C : (m + 1) * C] / ((clip_len[m * C : (m + 1) * C] - 1).float() * mdp.max_step_reward)).mean().item(),
+            "norm_return": (acc["ret"][m * C : (m + 1) * C] / ((clip_len[m * C : (m + 1) * C] - 1).float() * MAX_STEP_REWARD)).mean().item(),
             "n_failed": int(env.failed_eval[m * C : (m + 1) * C].sum().item()),
             "body_pos_cm": 100 * (s["pos"] / n) ** 0.5,
             "body_ori_deg": 57.2958 * (s["ori"] / n) ** 0.5,
@@ -124,15 +123,7 @@ def run(cks):
 
 
 cks = [torch.load(p, map_location=dev) for p in args.ckpts]
-# Compare reward presets without silently scoring a checkpoint with another run's configuration.
-groups = {}
-for i, ck in enumerate(cks):
-    key = tuple(vars(RewardCfg.from_args(ck["args"], len(kin.tracked_idx))).items())
-    groups.setdefault(key, []).append(i)
-res = [None] * len(cks)
-for ids in groups.values():
-    for i, result in zip(ids, run([cks[i] for i in ids])):
-        res[i] = result
+res = run(cks)
 cols = ["norm_return", "n_failed", "body_pos_cm", "body_ori_deg", "root_pos_cm", "joint_deg", "slip_cm_s", "ref_slip_cm_s", "contact_acc", "pen_mm"]
 lines = ["| checkpoint | train h | " + " | ".join(cols) + " |", "|---" * (len(cols) + 2) + "|"]
 for p, ck, r in zip(args.ckpts, cks, res):

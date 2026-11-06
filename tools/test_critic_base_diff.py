@@ -12,7 +12,7 @@ import torch
 from torch import nn
 
 from blinkmimic.buffer import ReplayBuffer
-from blinkmimic.mdp import MAX_STEP_REWARD, MDP, RewardCfg, flatten_state, unflatten_state
+from blinkmimic.mdp import MAX_STEP_REWARD, MDP, flatten_state, unflatten_state
 from blinkmimic.networks import Critic, Policy
 from blinkmimic.objective import actor_objective
 from blinkmimic.rotations import mat_to_quat, mv3, so3_exp
@@ -99,13 +99,6 @@ class CriticBaseDiffTest(unittest.TestCase):
             self.assertGreater(g.abs().sum().item(), 0)
 
     def test_actual_policy_update_passes_context_to_bootstrap_and_critic_targets(self):
-        self.check_policy_update('default')
-
-    def test_actual_policy_update_with_reference_rewards(self):
-        self.check_policy_update('reference')
-
-    def check_policy_update(self, preset):
-        self.mdp.set_reward_cfg(RewardCfg.from_preset(preset, len(self.mdp.kin.tracked_idx)))
         # Load the actual training functions without executing the train.py CLI/GPU setup.
         source = Path(__file__).parents[1] / 'src/blinkmimic/train.py'
         tree = ast.parse(source.read_text())
