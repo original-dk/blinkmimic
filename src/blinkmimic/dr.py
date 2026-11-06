@@ -55,6 +55,8 @@ class DomainRandCfg:
     """Root velocity kick (x, y, z, roll, pitch, yaw half-ranges) every push_interval_s."""
     reset_pos: tuple[float, float, float] = (0.05, 0.05, 0.01)
     reset_rot: tuple[float, float, float] = (0.1, 0.1, 0.2)
+    reset_yaw: float = math.pi / 2
+    """Independent world-z heading offset (radians, half-range); rotate root velocities with it. Zero disables it."""
     reset_lin_vel: tuple[float, float, float] = (0.5, 0.5, 0.2)
     reset_ang_vel: tuple[float, float, float] = (0.52, 0.52, 0.78)
     reset_joint_pos: float = 0.1

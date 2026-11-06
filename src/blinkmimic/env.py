@@ -21,7 +21,7 @@ from .dr import DomainRandomizer, XiLayout
 from .mdp import MAX_STEP_REWARD, MDP, flatten_state
 from .motion import CONTROL_DT, MotionLib
 from .robot import RobotSpec
-from .rotations import mat_to_quat, quat_to_mat, so3_exp
+from .rotations import mat_to_quat, mv3, quat_to_mat, so3_exp
 from .sensing import ObsPipeline
 
 
@@ -83,6 +83,16 @@ def make_sim(robot: RobotSpec) -> SimulationCfg:
             ccd_iterations=35,
         ),
     )
+
+
+def _randomize_reset_yaw(R: torch.Tensor, v: torch.Tensor, w: torch.Tensor, half: float):
+    """Rotate the reset pose and world velocities together; preserve tilt and body-frame velocities."""
+    if half == 0:
+        return R, v, w
+    rot = torch.zeros_like(v)
+    rot[:, 2].uniform_(-half, half)
+    Y = so3_exp(rot)
+    return Y @ R, mv3(Y, v), mv3(Y, w)
 
 
 def _bin_ema_w(stat: torch.Tensor, bins: torch.Tensor, x: torch.Tensor, wt: torch.Tensor, old: float) -> torch.Tensor:
@@ -237,6 +247,7 @@ class TrackingSim:
             q = q + torch.empty_like(q).uniform_(-c.reset_joint_pos, c.reset_joint_pos)
             if c.reset_joint_vel > 0:
                 qd = qd + torch.empty_like(qd).uniform_(-c.reset_joint_vel, c.reset_joint_vel)
+            R, v, w = _randomize_reset_yaw(R, v, w, c.reset_yaw)
         q = torch.clamp(q, self.mdp.kin.q_lo, self.mdp.kin.q_hi)
         # mjlab's reset clears solver warm-start data and actuator targets, so it runs before the writes
         self.sim.reset(env_ids)
@@ -296,6 +307,7 @@ class TrackingSim:
             q = q + torch.empty_like(q).uniform_(-c.reset_joint_pos, c.reset_joint_pos)
             if c.reset_joint_vel > 0:
                 qd = qd + torch.empty_like(qd).uniform_(-c.reset_joint_vel, c.reset_joint_vel)
+            R, v, w = _randomize_reset_yaw(R, v, w, c.reset_yaw)
         q = torch.clamp(q, self.mdp.kin.q_lo, self.mdp.kin.q_hi)
         # Simulation.reset (solver warm start, controls, ...) of the masked worlds, before the writes
         sim = self.sim

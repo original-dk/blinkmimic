@@ -13,9 +13,9 @@ import torch
 
 from blinkmimic.buffer import ReplayBuffer
 from blinkmimic.dr import DomainRandCfg
-from blinkmimic.env import TrackingSim
+from blinkmimic.env import TrackingSim, _randomize_reset_yaw
 from blinkmimic.mdp import MDP, flatten_state
-from blinkmimic.rotations import mat_to_quat, mv3, so3_exp
+from blinkmimic.rotations import mat_to_quat, mv3, quat_to_mat, so3_exp
 
 
 class RootKinematics:
@@ -153,6 +153,64 @@ class RelativeRewardTest(unittest.TestCase):
         _, terms = self.mdp.reward(S0, self.f, self.a, self.a, terms=True,
                                     init_root=e.init_root, init_f=e.init_f)
         torch.testing.assert_close(terms['e_root_pos'], torch.zeros(2), atol=1e-10, rtol=0)
+
+    def test_yaw_range_tilt_and_local_velocities(self):
+        n = 1024
+        R = self.R[:1].expand(n, -1, -1)
+        v, w = self.v[:1].expand(n, -1), self.w[:1].expand(n, -1)
+        YR, Yv, Yw = _randomize_reset_yaw(R, v, w, DomainRandCfg().reset_yaw)
+        Y = YR @ R.transpose(-1, -2)
+        angles = torch.atan2(Y[:, 1, 0], Y[:, 0, 0])
+        self.assertLessEqual(angles.abs().max().item(), torch.pi / 2)
+        self.assertLess(angles.min().item(), -1.4)
+        self.assertGreater(angles.max().item(), 1.4)
+        torch.testing.assert_close(YR[:, 2], R[:, 2])
+        torch.testing.assert_close(mv3(YR.transpose(-1, -2), Yv), mv3(R.transpose(-1, -2), v))
+        torch.testing.assert_close(mv3(YR.transpose(-1, -2), Yw), mv3(R.transpose(-1, -2), w))
+        for original, disabled in zip((R, v, w), _randomize_reset_yaw(R, v, w, 0)):
+            self.assertIs(original, disabled)
+
+    def test_yaw_reset_paths_and_mask_isolation(self):
+        indexed, masked = self.fake_env(), self.fake_env()
+        # Isolate yaw from the existing additive reset noise.
+        cfg = DomainRandCfg(reset_pos=(0.,) * 3, reset_rot=(0.,) * 3,
+                            reset_lin_vel=(0.,) * 3, reset_ang_vel=(0.,) * 3, reset_joint_pos=0.)
+        for e in (indexed, masked):
+            e.reset_noise, e.spec.dr = True, cfg
+        torch.manual_seed(17)
+        indexed.reset(torch.arange(2), self.f)
+        torch.manual_seed(17)
+        with patch('blinkmimic.env.wp.ScopedDevice', return_value=nullcontext()), \
+             patch('blinkmimic.env.mjwarp.reset_data'):
+            masked.reset_masked(torch.ones(2, dtype=torch.bool), self.f)
+        torch.testing.assert_close(indexed.init_root, masked.init_root)
+        pose = indexed.robot.write_root_link_pose_to_sim.call_args.args[0]
+        vel = indexed.robot.write_root_link_velocity_to_sim.call_args.args[0]
+        torch.testing.assert_close(mv3(quat_to_mat(pose[:, 3:]).transpose(-1, -2), vel[:, :3]),
+                                   mv3(self.R[self.f].transpose(-1, -2), self.v[self.f]))
+        torch.testing.assert_close(masked.sim.data.qvel[:, 3:6],
+                                   mv3(self.R[self.f].transpose(-1, -2), self.w[self.f]))
+        before = masked.init_root.clone()
+        with patch('blinkmimic.env.wp.ScopedDevice', return_value=nullcontext()), \
+             patch('blinkmimic.env.mjwarp.reset_data'):
+            masked.reset_masked(torch.tensor([True, False]), self.f)
+        torch.testing.assert_close(masked.init_root[1], before[1], atol=0, rtol=0)
+        self.assertFalse(torch.equal(masked.init_root[0], before[0]))
+
+    def test_all_tracking_rewards_invariant_to_episode_yaw(self):
+        S, S0 = list(self.ref_state(self.f)), self.ref_state(self.f0)
+        Y = so3_exp(torch.tensor([[0., 0., 1.5], [0., 0., -1.5]]))
+        # Rotate the trajectory around each reset position, leaving the expert untouched.
+        S[0] = S0[0] + mv3(Y, S[0] - S0[0])
+        S[1], S[2], S[3] = Y @ S[1], mv3(Y, S[2]), mv3(Y, S[3])
+        init = torch.cat((S0[0], mat_to_quat(Y @ S0[1])), -1)
+        base_init = torch.cat((S0[0], mat_to_quat(S0[1])), -1)
+        r, terms = self.mdp.reward(S, self.f, self.a, self.a, terms=True, init_root=init, init_f=self.f0)
+        expected = self.mdp.reward(self.ref_state(self.f), self.f, self.a, self.a,
+                                   init_root=base_init, init_f=self.f0)
+        torch.testing.assert_close(r, expected)
+        for k in ('e_root_pos', 'e_root_ori', 'e_body_pos', 'e_body_ori', 'e_body_linvel', 'e_body_angvel'):
+            torch.testing.assert_close(terms[k], torch.zeros(2), atol=3e-6, rtol=0)
 
     def test_replay_retains_context_after_resets_and_wrap(self):
         b = ReplayBuffer(2, 2, 'cpu', 1, 1)
