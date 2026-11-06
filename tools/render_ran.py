@@ -68,15 +68,42 @@ def ghost_pose(d, f: int, rollout: int):
     return p0 + Y @ (p - p0), Y @ R
 
 
+def select_rollouts(d, indices=None, clips=None, repeat=None):
+    """Render every recorded episode by default, preserving recording order and repeated motions."""
+    n = d["root_p"].shape[1]
+    if indices is not None:
+        if clips is not None or repeat is not None:
+            raise ValueError("rollout indices cannot be combined with --clips or --repeat")
+        if not indices or any(i < 0 or i >= n for i in indices):
+            raise ValueError("rollout index is outside the recorded range")
+        return list(indices)
+    mask = np.ones(n, dtype=bool)
+    if clips is not None:
+        names = list(d["names"])
+        if any(clip not in names for clip in clips):
+            raise ValueError("--clips contains an unknown motion")
+        mask &= np.isin(d["rollout_clip"], [names.index(clip) for clip in clips])
+    if repeat is not None:
+        if repeat < 0:
+            raise ValueError("--repeat must be nonnegative")
+        mask &= d["rollout_repeat"] == repeat
+    selected = np.flatnonzero(mask).tolist()
+    if not selected:
+        raise ValueError("no recorded episodes match the requested filters")
+    return selected
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("traj")
     ap.add_argument("out")
     ap.add_argument("--robot", type=str, default="g1")
-    ap.add_argument("--rollout", type=int, default=None, help="render one recorded rollout by its zero-based index")
-    ap.add_argument("--repeat", type=int, default=0, help="which recorded repeat to render (zero-based)")
+    selection = ap.add_mutually_exclusive_group()
+    selection.add_argument("--rollout", type=int, default=None, help="render one recorded episode (zero-based index)")
+    selection.add_argument("--rollouts", type=int, nargs="+", default=None, help="render these episodes in the given order")
+    ap.add_argument("--repeat", type=int, default=None, help="filter to this occurrence of each motion (zero-based)")
     ap.add_argument("--clips", nargs="*", default=None)
-    ap.add_argument("--seconds", type=float, default=10.0)
+    ap.add_argument("--seconds", type=float, default=10.0, help="seconds per episode; selected episodes are concatenated")
     ap.add_argument("--start", type=float, default=0.0)
     ap.add_argument("--fps", type=int, default=25)
     ap.add_argument("--width", type=int, default=960)
@@ -96,8 +123,11 @@ def main():
     names = list(d["names"])
     if "yaw" not in d or "rollout_clip" not in d or "rollout_repeat" not in d:
         ap.error("expected a recording from blinkmimic.evaluateran")
-    if a.repeat < 0 or a.repeat > int(d["rollout_repeat"].max()):
-        ap.error("--repeat is outside the recorded range")
+    try:
+        indices = [a.rollout] if a.rollout is not None else a.rollouts
+        rollouts = select_rollouts(d, indices, a.clips, a.repeat)
+    except ValueError as e:
+        ap.error(str(e))
     if a.fps <= 0 or a.fps > 50 or a.seconds <= 0 or a.start < 0:
         ap.error("require 0 < fps <= 50, seconds > 0 and start >= 0")
     robot = get_robot(a.robot)
@@ -113,21 +143,6 @@ def main():
     cam = mujoco.MjvCamera()
     cam.distance, cam.azimuth, cam.elevation = a.distance, a.azimuth, a.elevation
     font = ImageFont.load_default(size=22) if hasattr(ImageFont, "load_default") else None
-    if a.rollout is not None:
-        if not 0 <= a.rollout < d["root_p"].shape[1]:
-            ap.error("--rollout is outside the recorded range")
-        rollouts = [a.rollout]
-    else:
-        clips = a.clips or [names[int(i)] for i in dict.fromkeys(d["rollout_clip"].tolist())
-                            if np.any((d["rollout_clip"] == i) & (d["rollout_repeat"] == a.repeat))]
-        rollouts = []
-        for clip in clips:
-            if clip not in names:
-                ap.error(f"unknown clip: {clip}")
-            match = np.flatnonzero((d["rollout_clip"] == names.index(clip)) & (d["rollout_repeat"] == a.repeat))
-            if not len(match):
-                ap.error(f"clip {clip} has no recorded repeat {a.repeat}")
-            rollouts.append(int(match[0]))
     ff = subprocess.Popen(
         ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{a.width}x{a.height}", "-r", str(a.fps),
          "-i", "-", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20", a.out],
@@ -173,7 +188,7 @@ def main():
             draw = ImageDraw.Draw(img)
             # the clock keeps running after a termination (the robot is frozen at its last state), so videos of
             # several policies stay in sync
-            label = f"{a.title}  {clip}  t={t * 0.02:5.1f}s"
+            label = f"{a.title}  episode {c}  {clip}  t={t * 0.02:5.1f}s"
             if fell_at is not None:
                 label += f"  [terminated at {fell_at * 0.02:.1f}s]"
             for xy, txt in (((16, 12), label), ((16, a.height - 38), f"solid: simulated {robot.name} policy (mjlab + MuJoCo-Warp)   blue ghost: reference")):

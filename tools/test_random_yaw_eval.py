@@ -211,6 +211,24 @@ class RandomYawEvaluationTest(unittest.TestCase):
             np.testing.assert_array_equal(source.clip_id[d['start_frame']].numpy(), d['rollout_clip'])
             self.assertEqual(d['root_p'].shape[1], 12)
 
+    def test_renderer_selects_all_episodes_including_repeated_motions(self):
+        import importlib.util
+        from pathlib import Path
+        import numpy as np
+        spec = importlib.util.spec_from_file_location('render_ran', Path(__file__).with_name('render_ran.py'))
+        renderer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(renderer)
+        d = dict(names=['a', 'b'], root_p=np.zeros((5, 4, 3)),
+                 rollout_clip=np.array([0, 1, 0, 0]), rollout_repeat=np.array([0, 0, 1, 2]))
+        self.assertEqual(renderer.select_rollouts(d), [0, 1, 2, 3])
+        self.assertEqual(renderer.select_rollouts(d, indices=[3, 0]), [3, 0])
+        self.assertEqual(renderer.select_rollouts(d, clips=['a']), [0, 2, 3])
+        self.assertEqual(renderer.select_rollouts(d, repeat=0), [0, 1])
+        for kwargs in (dict(indices=[4]), dict(indices=[-1]), dict(repeat=3),
+                       dict(indices=[0], clips=['a'])):
+            with self.assertRaises(ValueError):
+                renderer.select_rollouts(d, **kwargs)
+
     def test_ghost_rotates_about_sampled_frame_without_modifying_expert(self):
         import importlib.util
         from pathlib import Path
