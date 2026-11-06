@@ -121,6 +121,34 @@ Other tools: `tools/eval_metrics.py` (accuracy and contact metrics), `tools/rend
 `python -m blinkmimic.evaluate --record`), `tools/export_onnx.py` and `tools/play_onnx.py` (deployment format and a
 check of it in the simulator; `play_onnx.py` needs `onnxruntime`: `uv run --with onnxruntime python tools/play_onnx.py ...`).
 
+## Evaluate with the reference's real position
+
+On branch `test_mimic_eval_real_pos`, evaluation and training retain the `main` implementation.
+`evaluate --record` saves the original expert root positions and orientations. The renderer now keeps
+those world positions by default, so horizontal drift between the robot and ghost stays visible.
+It does not re-anchor the reference to the robot each frame.
+
+After Setup, evaluate and record a checkpoint, then render all recorded clips:
+
+```bash
+source .venv/bin/activate
+python -m blinkmimic.evaluate \
+  --run_dir logs/run_s0 \
+  --ckpt logs/run_s0/ckpt_003500.pt \
+  --record logs/run_s0/traj.npz
+
+MUJOCO_GL=egl python tools/render.py \
+  logs/run_s0/traj.npz logs/run_s0/result_real_pos.mp4 \
+  --robot g1 --seconds 10
+```
+
+`--seconds 10` shows 10 seconds per selected clip. `--global_ghost` explicitly selects the same default
+world-position display and remains compatible with existing commands. To reproduce the original renderer's
+body-motion overlay, append `--anchor_ghost`; this follows the robot's current XY and hides horizontal drift.
+The two ghost flags are mutually exclusive. These flags affect only the video, not simulator motion,
+actor commands, rewards or evaluation statistics. Existing recordings can be rendered again without
+rerunning evaluation. Reference orientation and joint poses always come from the recorded expert frames.
+
 ## Attribution and licenses
 
 - **Code.** BlinkMimic builds on [supermimic_vibed](https://github.com/zita-ch/supermimic_vibed) (Chong Zhang,

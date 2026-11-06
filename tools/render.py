@@ -1,6 +1,8 @@
 """Render recorded evaluation trajectories (python -m blinkmimic.evaluate --record) with MuJoCo (EGL).
 
 The simulated robot is drawn solid; the reference motion is a translucent ghost.
+By default the ghost keeps the recorded reference's world position, so XY tracking drift stays visible.
+Use --anchor_ghost only to overlay body motion by following the robot's current XY.
 Usage: MUJOCO_GL=egl python tools/render.py traj.npz out.mp4 --robot g1 --clips dance1_subject1 jumps1_subject1 --seconds 12
 """
 
@@ -72,7 +74,11 @@ def main():
     ap.add_argument("--distance", type=float, default=3.6)
     ap.add_argument("--azimuth", type=float, default=135.0)
     ap.add_argument("--elevation", type=float, default=-12.0)
-    ap.add_argument("--global_ghost", action="store_true", help="draw the reference at its global xy instead of anchored to the robot")
+    ghost = ap.add_mutually_exclusive_group()
+    ghost.add_argument("--global_ghost", action="store_true", default=True,
+                       help="draw the reference at its recorded world position (default)")
+    ghost.add_argument("--anchor_ghost", dest="global_ghost", action="store_false",
+                       help="follow robot XY for body-motion comparison; hides horizontal drift")
     a = ap.parse_args()
 
     d = dict(np.load(a.traj))
@@ -114,7 +120,7 @@ def main():
             data.qpos[3:7] = d["root_quat"][tt, c]
             data.qpos[7:nq] = d["q"][tt, c]
             data.qpos[nq : nq + 3] = d["ref_root_p"][f]
-            if not a.global_ghost:  # anchor the reference to the robot's xy, as the tracking reward does
+            if not a.global_ghost:  # optional body-motion overlay; do not use it to assess XY tracking
                 data.qpos[nq : nq + 2] = d["root_p"][tt, c][:2]
             data.qpos[nq + 3 : nq + 7] = _mat_to_quat(d["ref_root_R"][f])
             data.qpos[nq + 7 : 2 * nq] = d["ref_q"][f]
