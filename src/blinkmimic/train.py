@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import dataclasses
 import json
 import math
 import os
@@ -126,10 +127,14 @@ parser.add_argument("--max_hours", type=float, default=None, help="stop after th
 parser.add_argument("--log_every", type=int, default=50)
 parser.add_argument("--motion_dir", type=str, default=None, help="defaults to the robot's motion directory")
 parser.add_argument("--log_dir", type=str, default=os.path.join(REPO, "logs", "run"))
+parser.add_argument("--xy_range", type=float, nargs=2, default=None, metavar=("LOW", "HIGH"),
+                    help="additional independent reset X/Y translation interval in meters (robot default: 0 0.1)")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--resume", type=str, default=None)
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 args = parser.parse_args()
+if args.xy_range is not None and (not all(math.isfinite(x) for x in args.xy_range) or args.xy_range[0] > args.xy_range[1]):
+    parser.error("--xy_range requires finite LOW <= HIGH")
 
 import torch
 import torch.nn as nn
@@ -158,6 +163,8 @@ os.makedirs(args.log_dir, exist_ok=True)
 json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent=2)
 
 robot = get_robot(args.robot)
+if args.xy_range is not None:
+    robot = dataclasses.replace(robot, dr=dataclasses.replace(robot.dr, reset_xy=tuple(args.xy_range)))
 J = robot.num_joints
 kin = Kinematics(robot, dev)
 motion = MotionLib.from_dir(args.motion_dir or robot.motion_dir, robot, kin, dev)

@@ -85,6 +85,13 @@ def make_sim(robot: RobotSpec) -> SimulationCfg:
     )
 
 
+def sample_reset_xy(p: torch.Tensor, xy_range: tuple[float, float], generator=None) -> torch.Tensor:
+    """Independent world-X/Y translations; leave height unchanged (also capturable in masked resets)."""
+    offset = torch.zeros_like(p)
+    offset[:, :2].uniform_(*xy_range, generator=generator)
+    return offset
+
+
 def _randomize_reset_yaw(R: torch.Tensor, v: torch.Tensor, w: torch.Tensor, half: float):
     """Rotate the reset pose and world velocities together; preserve tilt and body-frame velocities."""
     if half == 0:
@@ -241,6 +248,7 @@ class TrackingSim:
         if self.reset_noise:
             u = lambda half: torch.stack([torch.empty(n, device=dev).uniform_(-h, h) for h in half], -1)  # noqa: E731
             p = p + u(c.reset_pos)
+            p = p + sample_reset_xy(p, c.reset_xy)
             R = so3_exp(u(c.reset_rot)) @ R
             v = v + u(c.reset_lin_vel)
             w = w + u(c.reset_ang_vel)
@@ -301,6 +309,7 @@ class TrackingSim:
         if self.reset_noise:
             u = lambda half: torch.stack([torch.empty(N, device=dev).uniform_(-h, h) for h in half], -1)  # noqa: E731
             p = p + u(c.reset_pos)
+            p = p + sample_reset_xy(p, c.reset_xy)
             R = so3_exp(u(c.reset_rot)) @ R
             v = v + u(c.reset_lin_vel)
             w = w + u(c.reset_ang_vel)

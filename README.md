@@ -18,7 +18,7 @@ simulated in MuJoCo Warp under evaluation conditions. Blue ghost: reference moti
 ## Results
 
 The measurements below are from the original release. They have not been remeasured with this branch's
-relative reset rewards and random robot yaw. See [the current workflow](#current-workflow-training-to-rendering)
+relative reset rewards and random robot yaw/XY translation. See [the current workflow](#current-workflow-training-to-rendering)
 for this branch's commands and evaluation settings.
 
 All runs on one RTX 4090 (driver 580, CUDA 12.8, torch 2.9.0), the GPU otherwise idle. 40 LAFAN1 clips; every
@@ -119,11 +119,11 @@ Python installation is used for training, evaluation and rendering:
 source .venv/bin/activate
 ```
 
-### 1. Train with relative reset rewards and random robot yaw
+### 1. Train with relative reset rewards and random robot yaw/position
 
 ```bash
 PYTHON=python bash scripts/train.sh logs/run_s0 \
-  --seed 0 --iterations 3500 --ckpt_every 100
+  --seed 0 --iterations 3500 --ckpt_every 100 --xy_range 0 0.1
 ```
 
 This uses `PRESET[main]`, writes logs to `logs/run_s0`, and saves policy checkpoints such as
@@ -134,6 +134,12 @@ adds an independent, continuous uniform robot yaw offset in **[-90°, +90°]**, 
 The world linear and angular velocities rotate with that yaw. The range is configured by
 `DomainRandCfg.reset_yaw` in [`src/blinkmimic/dr.py`](src/blinkmimic/dr.py), in radians; `0` disables this extra
 rotation. There is currently no training `--yaw_degrees` flag.
+
+Training also adds independent world-X/Y translations, each uniform in **[0, 0.1] meters**, matching the
+reference initialization. This is added to the existing `reset_pos` noise; it does not add a new Z offset.
+Use `--xy_range LOW HIGH` to override `DomainRandCfg.reset_xy`; for example, `--xy_range -1 1` samples each
+horizontal component in [-1, 1] meters. `--xy_range 0 0` disables only this additional translation, while
+preserving the existing small reset noise. The saved robot reset position includes both noise and translation.
 
 Actor commands still come from the original `motion.goal(f, K)`, and observation references remain the original
 expert motion. Root position and orientation rewards compare robot and expert changes in their respective
@@ -147,11 +153,11 @@ python -m blinkmimic.evaluateran \
   --run_dir logs/run_s0 \
   --ckpt logs/run_s0/ckpt_003500.pt \
   --record logs/run_s0/traj_ran.npz \
-  --episodes 20 --yaw_degrees 90 --seed 0
+  --episodes 20 --yaw_degrees 90 --xy_range 0 0.1 --seed 0
 ```
 
 For each episode, this entry point uniformly samples a motion, uniformly samples a frame before its final
-frame, and samples a robot yaw offset. The last frame is excluded because evaluation needs at least one
+frame, and samples robot yaw and world-X/Y offsets. The last frame is excluded because evaluation needs at least one
 transition. Evaluation runs until termination or the motion end, with the return normalized by the number of
 transitions remaining after the sampled start. It retains the original actor commands and observation
 references, just as training does. Training's adaptive sampling and additional reset noise are not used here;
@@ -162,17 +168,20 @@ references, just as training does. Training's adaptive sampling and additional r
 | `--episodes 20` | Record 20 independent random starts; the default is 1. Motions may repeat. |
 | `--repeats n` | Multiply the episode count by `n`; this does not guarantee coverage of every motion. |
 | `--yaw_degrees 90` | Continuous uniform yaw offset in [-90°, +90°]; `0` disables the yaw offset. |
+| `--xy_range 0 0.1` | Each X/Y offset is uniform in [0, 0.1] meters; `0 0` disables translation. No extra Z offset. |
 | `--seed 0` | Reproduce the same sampled motions, frames and yaw values for the same settings. |
-| `--record path.npz` | Save robot trajectories, original references, sampled start frames and yaw offsets. |
+| `--record path.npz` | Save robot trajectories, original references, sampled start frames, yaw/position offsets and the actual robot reset pose. |
 
 The output includes `root_pos_rmse_m`, `root_pos_max_m`, `per_rollout_root_pos_rmse_m` and
 `per_rollout_root_pos_final_m`. These measure the **3D root displacement error**, including horizontal drift,
 in meters. Statistics include only active episode transitions. `starts` lists each motion, its local start
 frame and yaw offset (in radians). Use many episodes when comparing checkpoints; a single random start is
-not a full-library evaluation.
+not a full-library evaluation. `starts` also reports each `pos_offset_m` vector.
 
 To isolate the effect of yaw, repeat the same command with `--yaw_degrees 0` and a different recording filename.
 Keeping `--seed` and the episode count unchanged preserves the sampled motions and start frames.
+Likewise, compare `--xy_range 0 0` against another position range while holding yaw, seed and episode count
+fixed to isolate translation. Position sampling has a separate reproducible RNG stream.
 
 ### 3. Render the recorded episodes
 
@@ -186,8 +195,8 @@ By default, all recorded episodes are concatenated in recording order, including
 `--seconds 10` means **10 seconds per episode**, so 20 episodes produce a 200-second video. Episodes that end
 early display their final recorded state for the remaining video time; rendering does not sample new episodes.
 
-The ghost is transformed about the sampled expert root position `p0`, using the sampled yaw rotation `Y`:
-`p_ghost(f) = p0 + Y @ (p_expert(f) - p0)` and `R_ghost(f) = Y @ R_expert(f)`.
+The ghost uses the sampled expert root position `p0`, actual robot reset position `robot_p0`, and sampled yaw
+rotation `Y`: `p_ghost(f) = robot_p0 + Y @ (p_expert(f) - p0)` and `R_ghost(f) = Y @ R_expert(f)`.
 This is a display transform; it does not change actor commands or the evaluation reference motion.
 The default ghost follows its full transformed trajectory, so base drift stays visible. The text overlay
 reports the root distance in meters; `--clean` and `--white` omit the numerical overlay.
@@ -217,7 +226,7 @@ first recorded occurrences. Index selection (`--rollout` / `--rollouts`) cannot 
 ### Original evaluation and rendering
 
 The original entry points remain available. They evaluate all motions from their first frame without a robot
-yaw offset, while using this branch's current MDP/rewards:
+yaw or additional XY offset, while using this branch's current MDP/rewards:
 
 ```bash
 python -m blinkmimic.evaluate \

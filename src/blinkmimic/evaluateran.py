@@ -1,9 +1,9 @@
 """Evaluate from random motions, frames and robot headings, keeping original actor commands.
 
 python -m blinkmimic.evaluateran --run_dir logs/<run> --ckpt <checkpoint> --record traj.npz
-Each rollout samples a clip, a frame before its last frame, and a robot yaw offset. Expert motion,
+Each rollout samples a clip, a frame before its last frame, a robot yaw offset, and an XY translation. Expert motion,
 commands and observation references are untouched, as in training. Ghost alignment is display-only;
-render_ran.py uses the saved initial frame and yaw to rotate the reference about that reset position.
+render_ran.py uses the saved initial frame and yaw to rotate and translate the reference to the robot reset pose.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import math
 
 import torch
 
+from .env import sample_reset_xy
 from .motion import MotionLib
 from .rotations import mat_to_quat, mv3, so3_exp
 
@@ -38,11 +39,11 @@ def sample_starts(motion: MotionLib, n: int, half: float, seed: int):
 
 
 @torch.no_grad()
-def reset_random_yaw(env, frames: torch.Tensor, yaw: torch.Tensor):
-    """Reset from the untouched expert frame, rotating only the robot as in training.
+def reset_random_yaw(env, frames: torch.Tensor, yaw: torch.Tensor, pos_offset: torch.Tensor | None = None):
+    """Reset from the untouched expert frame, rotating and translating only the robot as in training.
 
     Reference frames, command generation and observation references remain unchanged. Save the
-    robot's rotated reset pose so reward compares each trajectory in its own initial frame.
+    robot's randomized reset pose so reward compares each trajectory in its own initial frame.
     """
     ids = torch.arange(len(frames), device=frames.device)
     env.reset(ids, frames)
@@ -50,6 +51,8 @@ def reset_random_yaw(env, frames: torch.Tensor, yaw: torch.Tensor):
     rot = torch.zeros_like(p)
     rot[:, 2] = yaw
     Y = so3_exp(rot)
+    if pos_offset is not None:
+        p = p + pos_offset
     pose = torch.cat((p, mat_to_quat(Y @ R)), -1)
     env.robot.write_root_link_pose_to_sim(torch.cat((p + env.scene.env_origins, pose[:, 3:]), -1), env_ids=ids)
     env.robot.write_root_link_velocity_to_sim(torch.cat((mv3(Y, v), mv3(Y, w)), -1), env_ids=ids)
@@ -79,10 +82,14 @@ def main():
     parser.add_argument("--episodes", type=int, default=1, help="independent random motion/frame/yaw rollouts")
     parser.add_argument("--repeats", type=int, default=1, help="multiply --episodes by this count")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--xy_range", type=float, nargs=2, default=(0.0, 0.1), metavar=("LOW", "HIGH"),
+                        help="independent world-X/Y reset translation interval in meters (0 0 disables)")
     parser.add_argument("--yaw_degrees", type=float, default=90.0, help="uniform yaw offset half-range (degrees; 0 disables)")
     args = parser.parse_args()
     if not 0 <= args.yaw_degrees <= 180:
         parser.error("--yaw_degrees must be between 0 and 180")
+    if not all(math.isfinite(x) for x in args.xy_range) or args.xy_range[0] > args.xy_range[1]:
+        parser.error("--xy_range requires finite LOW <= HIGH")
     if args.repeats < 1 or args.episodes < 1:
         parser.error("--episodes and --repeats must be positive")
 
@@ -138,6 +145,8 @@ def main():
     mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)
     N = args.episodes * args.repeats
     clip_of, start_frames, yaw = sample_starts(motion, N, math.radians(args.yaw_degrees), args.seed)
+    pos_rng = torch.Generator(device=motion.root_p.device).manual_seed(args.seed + 1)
+    pos_offset = sample_reset_xy(motion.root_p[start_frames], tuple(args.xy_range), pos_rng)
 
 
     @torch.no_grad()
@@ -152,7 +161,7 @@ def main():
         pi.eval()
         env.done_eval[:] = False
         env.failed_eval[:] = False
-        reset_random_yaw(env, start_frames, yaw)
+        reset_random_yaw(env, start_frames, yaw, pos_offset)
         clip_end = motion.clip_end[clip_of]
         ret = torch.zeros(N, device=dev)
         root_sq_sum = torch.zeros(N, device=dev)
@@ -195,6 +204,7 @@ def main():
             "fail_rate": env.failed_eval.float().mean().item(),
             "failed": [motion.names[i] for i in sampled if fail_c[i] > 0],
             "yaw_degrees": args.yaw_degrees,
+            "xy_range_m": args.xy_range,
             "seed": args.seed,
             "n_rollouts": N,
             "root_pos_rmse_m": (root_sq_sum.sum() / steps.sum().clamp(min=1)).sqrt().item(),
@@ -204,8 +214,8 @@ def main():
             "per_clip": {motion.names[i]: round(norm_c[i].item(), 4) for i in sampled},
             "per_clip_count": {motion.names[i]: int(counts[i].item()) for i in sampled},
             "per_clip_fail_rate": {motion.names[i]: round(fail_c[i].item(), 3) for i in sampled},
-            "starts": [{"motion": motion.names[c], "frame": int(f - motion.clip_start[c]), "yaw": float(y)}
-                       for c, f, y in zip(clip_of.tolist(), start_frames.tolist(), yaw.tolist())],
+            "starts": [{"motion": motion.names[c], "frame": int(f - motion.clip_start[c]), "yaw": float(y), "pos_offset_m": offset}
+                       for c, f, y, offset in zip(clip_of.tolist(), start_frames.tolist(), yaw.tolist(), pos_offset.tolist())],
         }
         if record:
             clip_cpu = clip_of.cpu().numpy()
@@ -214,7 +224,8 @@ def main():
             for i, c in enumerate(clip_cpu):
                 repeat_of[i], seen[c] = seen[c], seen[c] + 1
             np.savez_compressed(record, names=np.array(motion.names), yaw=yaw.cpu().numpy(),
-                                start_frame=start_frames.cpu().numpy(), rollout_clip=clip_cpu, rollout_repeat=repeat_of, **{k: torch.stack(v).numpy() for k, v in traj.items()},
+                                start_frame=start_frames.cpu().numpy(), init_root=env.init_root.cpu().numpy(),
+                                pos_offset=pos_offset.cpu().numpy(), rollout_clip=clip_cpu, rollout_repeat=repeat_of, **{k: torch.stack(v).numpy() for k, v in traj.items()},
                                 ref_root_p=motion.root_p.cpu().numpy(), ref_root_R=motion.root_R.cpu().numpy(), ref_q=motion.q.cpu().numpy(),
                                 clip_start=motion.clip_start.cpu().numpy(), clip_len=motion.clip_len.cpu().numpy())  # fmt: skip
         return res

@@ -9,6 +9,7 @@ import unittest
 import torch
 
 from blinkmimic.evaluateran import reset_random_yaw, sample_starts
+from blinkmimic.env import sample_reset_xy
 from blinkmimic.mdp import MDP
 from blinkmimic.motion import MotionLib
 from blinkmimic.rotations import mat_to_quat, mv3, so3_exp
@@ -99,6 +100,63 @@ class RandomYawEvaluationTest(unittest.TestCase):
         obs = e.mdp.obs(S, torch.zeros(2, 1), torch.zeros(2, 1), frames)
         base_obs = e.mdp.obs(self.source.ref_state(frames), torch.zeros(2, 1), torch.zeros(2, 1), frames)
         self.assertGreater((obs - base_obs).abs().max().item(), .1)
+
+    def test_translation_and_yaw_reset_keep_commands_and_relative_position_reward(self):
+        e = self.make_env()
+        frames, yaw = torch.tensor([2, 5]), torch.tensor([1.2, -1.4])
+        offset = torch.tensor([[3., -2., 0.], [-4., 5., 0.]])
+        command = self.source.goal(frames, 5).clone()
+        reset_random_yaw(e, frames, yaw, offset)
+        torch.testing.assert_close(e.init_root[:, :3], self.source.root_p[frames] + offset)
+        torch.testing.assert_close(self.source.goal(frames, 5), command, atol=0, rtol=0)
+        Y = so3_exp(torch.stack((yaw*0, yaw*0, yaw), -1))
+        f = frames + 1
+        p = e.init_root[:, :3] + mv3(Y, self.source.root_p[f] - self.source.root_p[frames])
+        S = (p, Y @ self.source.root_R[f], mv3(Y, self.source.root_v[f]), mv3(Y, self.source.root_w[f]),
+             self.source.q[f], self.source.qd[f])
+        a = torch.zeros(2, 1)
+        _, terms = e.mdp.reward(S, f, a, a, terms=True, init_root=e.init_root, init_f=frames)
+        torch.testing.assert_close(terms['e_root_pos'], torch.zeros(2), atol=1e-10, rtol=0)
+
+    def test_xy_sampling_bounds_seed_height_and_compile(self):
+        p = torch.randn(1024, 3)
+        rng = torch.Generator().manual_seed(123)
+        offset = sample_reset_xy(p, (-3., 4.), rng)
+        again = sample_reset_xy(p, (-3., 4.), torch.Generator().manual_seed(123))
+        torch.testing.assert_close(offset, again, atol=0, rtol=0)
+        self.assertTrue((offset[:, :2] >= -3).all() and (offset[:, :2] <= 4).all())
+        self.assertLess(offset[:, :2].min().item(), -2.9)
+        self.assertGreater(offset[:, :2].max().item(), 3.9)
+        torch.testing.assert_close(offset[:, 2], torch.zeros(1024), atol=0, rtol=0)
+        torch.testing.assert_close(sample_reset_xy(p, (0., 0.)), torch.zeros_like(p), atol=0, rtol=0)
+        compiled = torch.compile(sample_reset_xy, backend='aot_eager', fullgraph=True)
+        torch.testing.assert_close(compiled(p, (.2, .2))[:, :2], torch.full((1024, 2), .2))
+
+    def test_indexed_and_masked_training_translation_preserve_other_worlds(self):
+        from contextlib import nullcontext
+        from unittest.mock import patch
+        from blinkmimic.dr import DomainRandCfg
+        a, b = self.make_env(), self.make_env()
+        for e in (a, b):
+            e.reset_noise = True
+            e.spec.dr = DomainRandCfg(reset_xy=(.2, .2), reset_pos=(0.,)*3, reset_rot=(0.,)*3,
+                                     reset_yaw=0., reset_lin_vel=(0.,)*3, reset_ang_vel=(0.,)*3,
+                                     reset_joint_pos=0.)
+        frames = torch.tensor([2, 5])
+        a.reset(torch.arange(2), frames)
+        with patch('blinkmimic.env.wp.ScopedDevice', return_value=nullcontext()), \
+             patch('blinkmimic.env.mjwarp.reset_data'):
+            b.reset_masked(torch.ones(2, dtype=torch.bool), frames)
+        expected = self.source.root_p[frames] + torch.tensor([.2, .2, 0.])
+        torch.testing.assert_close(a.init_root[:, :3], expected)
+        torch.testing.assert_close(a.init_root, b.init_root)
+        before = b.init_root.clone()
+        a.reset(torch.tensor([0]), torch.tensor([1]))
+        with patch('blinkmimic.env.wp.ScopedDevice', return_value=nullcontext()), \
+             patch('blinkmimic.env.mjwarp.reset_data'):
+            b.reset_masked(torch.tensor([True, False]), torch.tensor([1, 4]))
+        torch.testing.assert_close(a.init_root, b.init_root)
+        torch.testing.assert_close(b.init_root[1], before[1], atol=0, rtol=0)
 
     def test_zero_yaw_and_remaining_return_normalization(self):
         e = self.make_env()
@@ -214,6 +272,11 @@ class RandomYawEvaluationTest(unittest.TestCase):
             np.testing.assert_array_equal(d['f'][0], d['start_frame'])
             np.testing.assert_array_equal(source.clip_id[d['start_frame']].numpy(), d['rollout_clip'])
             self.assertEqual(d['root_p'].shape[1], 12)
+            self.assertTrue(((d['pos_offset'][:, :2] >= 0) & (d['pos_offset'][:, :2] <= .1)).all())
+            np.testing.assert_array_equal(d['pos_offset'][:, 2], 0)
+            np.testing.assert_allclose(d['init_root'][:, :3],
+                                       source.root_p[d['start_frame']].numpy() + d['pos_offset'])
+            np.testing.assert_allclose(d['root_p'][0], d['init_root'][:, :3])
 
     def test_long_trajectory_ghost_distance_equals_reward_base_error(self):
         import importlib.util
@@ -237,12 +300,12 @@ class RandomYawEvaluationTest(unittest.TestCase):
         mdp = MDP(RootKinematics(), m, torch.zeros(1), 1)
         for yaw in (-1.57, -.73, 0., .82, 1.57):
             Y = so3_exp(torch.tensor([0., 0., yaw]))
-            p0 = m.root_p[f0]
-            ideal_p = p0 + mv3(Y, m.root_p[f] - p0)
+            p0 = m.root_p[f0] + torch.tensor([3., -2., 0.])
+            ideal_p = p0 + mv3(Y, m.root_p[f] - m.root_p[f0])
             R = Y @ m.root_R[f]
             init = torch.cat((p0, mat_to_quat(Y @ m.root_R[f0])), -1).expand(len(f), -1)
             d = dict(ref_root_p=m.root_p.numpy(), ref_root_R=m.root_R.numpy(),
-                     start_frame=np.array([f0]), yaw=np.array([yaw]))
+                     start_frame=np.array([f0]), yaw=np.array([yaw]), init_root=init[:1].numpy())
             ghost = torch.tensor(np.stack([renderer.ghost_pose(d, int(i), 0)[0] for i in f]), dtype=torch.float32)
             torch.testing.assert_close(ideal_p, ghost, atol=4e-6, rtol=1e-6)
             for offset in (torch.zeros(3), torch.tensor([.7, -.4, .2])):

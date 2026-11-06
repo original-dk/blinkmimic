@@ -65,7 +65,8 @@ def ghost_pose(d, f: int, rollout: int):
     c, s = np.cos(yaw), np.sin(yaw)
     Y = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
     p0 = d["ref_root_p"][int(d["start_frame"][rollout])]
-    return p0 + Y @ (p - p0), Y @ R
+    robot_p0 = d["init_root"][rollout, :3] if "init_root" in d else p0
+    return robot_p0 + Y @ (p - p0), Y @ R
 
 
 def select_rollouts(d, indices=None, clips=None, repeat=None):
