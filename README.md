@@ -17,6 +17,10 @@ simulated in MuJoCo Warp under evaluation conditions. Blue ghost: reference moti
 
 ## Results
 
+The measurements below are from the original release. They have not been remeasured with this branch's
+relative reset rewards and random robot yaw. See [the current workflow](#current-workflow-training-to-rendering)
+for this branch's commands and evaluation settings.
+
 All runs on one RTX 4090 (driver 580, CUDA 12.8, torch 2.9.0), the GPU otherwise idle. 40 LAFAN1 clips; every
 checkpoint (one per 100 iterations) evaluated on all 40 clips from their first frame with 4 replicas; return and
 failed clips are averaged over the replicas. Minutes are training wall-clock, including compilation, CUDA-graph capture, probe sweeps and
@@ -90,7 +94,8 @@ Foot slip of the reference motion itself: 10.2 cm/s.
 | collection step, episode resets and probe sweep as CUDA graphs; sweep on a side stream; checkpoints written by a background thread | – | – | ✓ | `--graph_early --collect_graph --reset_masked --eprobe_graph --eprobe_async --ckpt_light` |
 
 The released recipe is `PRESET[main]` in [`scripts/presets.sh`](scripts/presets.sh). `python -m blinkmimic.train`
-without flags is the SuperMimic baseline; all methods share simulator, MDP, reward and evaluator.
+without flags uses the SuperMimic optimizer settings. On this branch, the simulator and MDP also use the
+relative reset rewards and robot yaw randomization described below.
 
 ## Setup
 
@@ -104,6 +109,129 @@ uv sync                          # .venv with mjlab, MuJoCo Warp, Warp, torch 2.
 tools/download_data.sh           # 40 G1-retargeted LAFAN1 clips + G1 description -> data/
 uv run python tools/test_env.py  # sanity check: FK vs simulator, state round-trip, reference playback
 ```
+
+## Current workflow: training to rendering
+
+Run these commands from the repository root after completing Setup. Activate the environment so the same
+Python installation is used for training, evaluation and rendering:
+
+```bash
+source .venv/bin/activate
+```
+
+### 1. Train with relative reset rewards and random robot yaw
+
+```bash
+PYTHON=python bash scripts/train.sh logs/run_s0 \
+  --seed 0 --iterations 3500 --ckpt_every 100
+```
+
+This uses `PRESET[main]`, writes logs to `logs/run_s0`, and saves policy checkpoints such as
+`logs/run_s0/ckpt_003500.pt`. On a shared GPU, append `--eprobe_async 0` as noted below.
+
+Training samples a motion time bin using return/failure statistics, then a frame inside that bin. Each reset
+adds an independent, continuous uniform robot yaw offset in **[-90°, +90°]**, on top of the original reset noise.
+The world linear and angular velocities rotate with that yaw. The range is configured by
+`DomainRandCfg.reset_yaw` in [`src/blinkmimic/dr.py`](src/blinkmimic/dr.py), in radians; `0` disables this extra
+rotation. There is currently no training `--yaw_degrees` flag.
+
+Actor commands still come from the original `motion.goal(f, K)`, and observation references remain the original
+expert motion. Root position and orientation rewards compare robot and expert changes in their respective
+initial root frames: the robot uses its pose after reset randomization, and the expert uses the sampled frame
+before randomization. The reset context is also retained in replay and imagined rollouts.
+
+### 2. Evaluate and record multiple random episodes
+
+```bash
+python -m blinkmimic.evaluateran \
+  --run_dir logs/run_s0 \
+  --ckpt logs/run_s0/ckpt_003500.pt \
+  --record logs/run_s0/traj_ran.npz \
+  --episodes 20 --yaw_degrees 90 --seed 0
+```
+
+For each episode, this entry point uniformly samples a motion, uniformly samples a frame before its final
+frame, and samples a robot yaw offset. The last frame is excluded because evaluation needs at least one
+transition. Evaluation runs until termination or the motion end, with the return normalized by the number of
+transitions remaining after the sampled start. It retains the original actor commands and observation
+references, just as training does. Training's adaptive sampling and additional reset noise are not used here;
+`--dr_from` separately enables the existing robustness evaluation options.
+
+| Option | Meaning |
+|---|---|
+| `--episodes 20` | Record 20 independent random starts; the default is 1. Motions may repeat. |
+| `--repeats n` | Multiply the episode count by `n`; this does not guarantee coverage of every motion. |
+| `--yaw_degrees 90` | Continuous uniform yaw offset in [-90°, +90°]; `0` disables the yaw offset. |
+| `--seed 0` | Reproduce the same sampled motions, frames and yaw values for the same settings. |
+| `--record path.npz` | Save robot trajectories, original references, sampled start frames and yaw offsets. |
+
+The output includes `root_pos_rmse_m`, `root_pos_max_m`, `per_rollout_root_pos_rmse_m` and
+`per_rollout_root_pos_final_m`. These measure the **3D root displacement error**, including horizontal drift,
+in meters. Statistics include only active episode transitions. `starts` lists each motion, its local start
+frame and yaw offset (in radians). Use many episodes when comparing checkpoints; a single random start is
+not a full-library evaluation.
+
+To isolate the effect of yaw, repeat the same command with `--yaw_degrees 0` and a different recording filename.
+Keeping `--seed` and the episode count unchanged preserves the sampled motions and start frames.
+
+### 3. Render the recorded episodes
+
+```bash
+MUJOCO_GL=egl python tools/render_ran.py \
+  logs/run_s0/traj_ran.npz logs/run_s0/result_ran.mp4 \
+  --robot g1 --seconds 10
+```
+
+By default, all recorded episodes are concatenated in recording order, including repeated motions.
+`--seconds 10` means **10 seconds per episode**, so 20 episodes produce a 200-second video. Episodes that end
+early display their final recorded state for the remaining video time; rendering does not sample new episodes.
+
+The ghost is transformed about the sampled expert root position `p0`, using the sampled yaw rotation `Y`:
+`p_ghost(f) = p0 + Y @ (p_expert(f) - p0)` and `R_ghost(f) = Y @ R_expert(f)`.
+This is a display transform; it does not change actor commands or the evaluation reference motion.
+The default ghost follows its full transformed trajectory, so base drift stays visible. The text overlay
+reports the root distance in meters; `--clean` and `--white` omit the numerical overlay.
+
+```bash
+# Render selected episodes (zero-based indices) in this order.
+MUJOCO_GL=egl python tools/render_ran.py \
+  logs/run_s0/traj_ran.npz logs/run_s0/selected.mp4 \
+  --robot g1 --seconds 10 --rollouts 0 2 5
+
+# Render one episode.
+MUJOCO_GL=egl python tools/render_ran.py \
+  logs/run_s0/traj_ran.npz logs/run_s0/episode0.mp4 \
+  --robot g1 --seconds 10 --rollout 0
+
+# Overlay body motion by following the robot's current XY, like the original renderer.
+MUJOCO_GL=egl python tools/render_ran.py \
+  logs/run_s0/traj_ran.npz logs/run_s0/anchored.mp4 \
+  --robot g1 --seconds 10 --anchor_ghost
+```
+
+`--anchor_ghost` hides horizontal trajectory drift in the display; it does not improve tracking or change
+the error statistics. Use the default full trajectory and the root error metrics to assess displacement.
+For filtering, `--clips <names...>` selects every recorded episode of those motions; `--repeat 0` selects their
+first recorded occurrences. Index selection (`--rollout` / `--rollouts`) cannot be combined with these filters.
+
+### Original evaluation and rendering
+
+The original entry points remain available. They evaluate all motions from their first frame without a robot
+yaw offset, while using this branch's current MDP/rewards:
+
+```bash
+python -m blinkmimic.evaluate \
+  --run_dir logs/run_s0 --ckpt logs/run_s0/ckpt_003500.pt \
+  --record logs/run_s0/traj.npz
+
+MUJOCO_GL=egl python tools/render.py \
+  logs/run_s0/traj.npz logs/run_s0/result.mp4 \
+  --robot g1 --seconds 10
+```
+
+The original renderer follows robot XY by default; add `--global_ghost` there to show the reference's full
+spatial trajectory. Keep this display difference and the evaluation start distribution in mind when comparing
+videos or returns against `evaluateran` / `render_ran.py`.
 
 ## Train, evaluate, reproduce
 
