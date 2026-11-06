@@ -8,10 +8,11 @@ import unittest
 
 import torch
 
-from blinkmimic.evaluateran import random_yaw_motion
+from blinkmimic.evaluateran import reset_random_yaw, sample_starts
 from blinkmimic.mdp import MDP
 from blinkmimic.motion import MotionLib
 from blinkmimic.rotations import mat_to_quat, mv3, so3_exp
+import test_relative_reward as relative
 from test_relative_reward import RootKinematics
 
 
@@ -34,67 +35,204 @@ class RandomYawEvaluationTest(unittest.TestCase):
         m.root_gz = m.root_R[:, 2, 2]
         self.source = m
 
-    def test_seed_range_and_source_unchanged(self):
-        before = {k: v.clone() for k, v in vars(self.source).items() if isinstance(v, torch.Tensor)}
-        torch.manual_seed(3)
-        a, yaw = random_yaw_motion(self.source, 3, math.pi / 2)
-        torch.manual_seed(3)
-        b, yaw_b = random_yaw_motion(self.source, 3, math.pi / 2)
-        torch.testing.assert_close(yaw, yaw_b)
-        torch.testing.assert_close(a.root_p, b.root_p)
+    def test_sampling_seed_bounds_and_all_valid_frames(self):
+        before = torch.get_rng_state().clone()
+        a = sample_starts(self.source, 8192, math.pi / 2, 7)
+        b = sample_starts(self.source, 8192, math.pi / 2, 7)
+        torch.testing.assert_close(torch.get_rng_state(), before)
+        for x, y in zip(a, b):
+            torch.testing.assert_close(x, y)
+        clips, frames, yaw = a
+        self.assertEqual(set(clips.tolist()), {0, 1})
+        self.assertEqual(set(frames.tolist()), {0, 1, 2, 4, 5, 6})
+        self.assertTrue((frames >= self.source.clip_start[clips]).all())
+        self.assertTrue((frames < self.source.clip_end[clips]).all())
         self.assertTrue((yaw.abs() <= math.pi / 2).all())
-        self.assertEqual(len(torch.unique(yaw)), 6)
+        self.assertFalse(torch.equal(frames, sample_starts(self.source, 8192, math.pi / 2, 8)[1]))
+
+    def test_short_clips_and_disabled_yaw(self):
+        self.source.clip_len = torch.tensor([1, 4])
+        clips, frames, yaw = sample_starts(self.source, 100, 0, 0)
+        self.assertTrue((clips == 1).all())
+        torch.testing.assert_close(yaw, torch.zeros(100))
+        self.source.clip_len.fill_(1)
+        with self.assertRaises(ValueError):
+            sample_starts(self.source, 1, 1, 0)
+        with self.assertRaises(ValueError):
+            sample_starts(self.source, 0, 1, 0)
+
+    def make_env(self):
+        fixture = relative.RelativeRewardTest()
+        fixture.setUp()
+        e = fixture.fake_env()
+        e.motion = self.source
+        e.mdp = MDP(RootKinematics(), self.source, torch.zeros(1), 1)
+        return e
+
+    def test_robot_only_yaw_reset_preserves_original_commands_and_reference(self):
+        e = self.make_env()
+        frames, yaw = torch.tensor([2, 5]), torch.tensor([1.2, -1.4])
+        before = {k: v.clone() for k, v in vars(self.source).items() if isinstance(v, torch.Tensor)}
+        commands = self.source.goal(frames, 5).clone()
+        reset_random_yaw(e, frames, yaw)
+        self.assertIs(e.motion, self.source)
+        self.assertIs(e.mdp.motion, self.source)
+        torch.testing.assert_close(self.source.goal(frames, 5), commands, atol=0, rtol=0)
         for k, v in before.items():
             torch.testing.assert_close(getattr(self.source, k), v, atol=0, rtol=0)
-        self.assertIsNot(a, self.source)
+        Y = so3_exp(torch.stack((yaw*0, yaw*0, yaw), -1))
+        pose = e.robot.write_root_link_pose_to_sim.call_args.args[0]
+        vel = e.robot.write_root_link_velocity_to_sim.call_args.args[0]
+        torch.testing.assert_close(pose[:, :3], self.source.root_p[frames])
+        torch.testing.assert_close(pose[:, 3:], mat_to_quat(Y @ self.source.root_R[frames]))
+        torch.testing.assert_close(vel[:, :3], mv3(Y, self.source.root_v[frames]))
+        torch.testing.assert_close(vel[:, 3:], mv3(Y, self.source.root_w[frames]))
+        torch.testing.assert_close(e.init_root, pose)
+        torch.testing.assert_close(e.init_f, frames)
+        S = (pose[:, :3], Y @ self.source.root_R[frames], vel[:, :3], vel[:, 3:],
+             self.source.q[frames], self.source.qd[frames])
+        _, terms = e.mdp.reward(S, frames, torch.zeros(2, 1), torch.zeros(2, 1), terms=True,
+                                init_root=e.init_root, init_f=e.init_f)
+        for k in ('e_root_pos', 'e_root_ori', 'e_body_linvel', 'e_body_angvel'):
+            torch.testing.assert_close(terms[k], torch.zeros(2), atol=3e-6, rtol=0)
+        # Observation keeps the original reference too, matching the training path.
+        obs = e.mdp.obs(S, torch.zeros(2, 1), torch.zeros(2, 1), frames)
+        base_obs = e.mdp.obs(self.source.ref_state(frames), torch.zeros(2, 1), torch.zeros(2, 1), frames)
+        self.assertGreater((obs - base_obs).abs().max().item(), .1)
 
-    def test_repeats_metadata_and_zero_yaw(self):
-        m, _ = random_yaw_motion(self.source, 3, 0)
-        torch.testing.assert_close(m.clip_start, torch.tensor([0, 4, 8, 12, 16, 20]))
-        torch.testing.assert_close(m.clip_end, m.clip_start + 3)
-        torch.testing.assert_close(m.bin_start[m.frame_bin], m.clip_start[m.clip_id])
-        for c in range(6):
-            f = torch.tensor([m.clip_start[c]])
-            torch.testing.assert_close(m.future_frames(f, 8).max(), m.clip_end[c])
-        for k in ('root_p', 'root_R', 'body_p', 'body_R', 'root_v', 'root_w', 'body_v', 'body_w'):
-            x = getattr(self.source, k)
-            torch.testing.assert_close(getattr(m, k), x.repeat(3, *([1] * (x.ndim - 1))))
+    def test_zero_yaw_and_remaining_return_normalization(self):
+        e = self.make_env()
+        frames = torch.tensor([2, 6])  # penultimate frames: exactly one transition remains
+        reset_random_yaw(e, frames, torch.zeros(2))
+        pose = e.robot.write_root_link_pose_to_sim.call_args.args[0]
+        torch.testing.assert_close(pose[:, 3:], mat_to_quat(self.source.root_R[frames]))
+        remaining = self.source.clip_end[self.source.clip_id[frames]] - frames
+        torch.testing.assert_close(remaining, torch.ones(2, dtype=torch.long))
 
-    def test_positions_rotations_and_velocities_follow_rollout_yaw(self):
-        m, yaw = random_yaw_motion(self.source, 3, math.pi)
-        for c in range(6):
-            original = c % 2
-            s, s0 = int(m.clip_start[c]), int(self.source.clip_start[original])
-            Y = so3_exp(torch.tensor([0., 0., yaw[c]]))
-            origin = self.source.root_p[s0]
-            for t in range(4):
-                torch.testing.assert_close(m.root_p[s+t], origin + Y @ (self.source.root_p[s0+t] - origin))
-                torch.testing.assert_close(m.root_R[s+t], Y @ self.source.root_R[s0+t])
-                torch.testing.assert_close(m.body_p[s+t, 0], m.root_p[s+t])
-                torch.testing.assert_close(m.body_R[s+t, 0], m.root_R[s+t])
-                torch.testing.assert_close(m.root_v[s+t], Y @ self.source.root_v[s0+t])
-                torch.testing.assert_close(m.root_w[s+t], Y @ self.source.root_w[s0+t])
-            torch.testing.assert_close(m.root_p[s], origin)
+    def test_evaluator_loop_records_original_commands_and_remaining_returns(self):
+        from contextlib import ExitStack, redirect_stdout
+        import io
+        import json
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        import numpy as np
+        from blinkmimic.evaluateran import main
+        from blinkmimic.mdp import MAX_STEP_REWARD
 
-    def test_policy_observations_goals_rewards_and_termination_are_aligned(self):
-        m, _ = random_yaw_motion(self.source, 3, math.pi)
-        base = MDP(RootKinematics(), self.source, torch.zeros(1), 1)
-        aligned = MDP(RootKinematics(), m, torch.zeros(1), 1)
-        f = m.clip_start + 1
-        f_base = self.source.clip_start.repeat(3) + 1
-        S, ref = m.ref_state(f), self.source.ref_state(f_base)
-        a, xi = torch.zeros(6, 1), torch.zeros(6, 1)
-        torch.testing.assert_close(aligned.obs(S, a, xi, f), base.obs(ref, a, xi, f_base), atol=2e-6, rtol=1e-5)
-        torch.testing.assert_close(m.goal(f, 5), self.source.goal(f_base, 5), atol=2e-6, rtol=1e-5)
-        init = torch.cat((m.root_p[m.clip_start], mat_to_quat(m.root_R[m.clip_start])), -1)
-        init_base = torch.cat((self.source.root_p[self.source.clip_start],
-                               mat_to_quat(self.source.root_R[self.source.clip_start])), -1).repeat(3, 1)
-        torch.testing.assert_close(aligned.reward(S, f, a, a, init_root=init, init_f=m.clip_start),
-                                   base.reward(ref, f_base, a, a, init_root=init_base,
-                                               init_f=self.source.clip_start.repeat(3)))
-        torch.testing.assert_close(aligned.termination(S, f), base.termination(ref, f_base))
-        # Absolute reference input would command a turn back; aligned input removes that offset.
-        self.assertGreater((base.obs(S, a, xi, f_base) - aligned.obs(S, a, xi, f)).abs().max().item(), .1)
+        source = self.source
+        instances, commands = [], []
+
+        class Env:
+            def __init__(self, cfg, n, robot, motion, mdp, dev, **kwargs):
+                instances.append(self)
+                self.N, self.motion, self.mdp = n, motion, mdp
+                self.done_eval = torch.zeros(n, dtype=torch.bool)
+                self.failed_eval = torch.zeros(n, dtype=torch.bool)
+                self.init_root = torch.zeros(n, 7)
+                self.scene = SimpleNamespace(env_origins=torch.zeros(n, 3))
+                self.robot = Mock()
+                self.robot.write_root_link_pose_to_sim.side_effect = lambda pose, **kw: setattr(self, 'pose', pose)
+                self.robot.write_root_link_velocity_to_sim.side_effect = lambda vel, **kw: setattr(self, 'vel', vel)
+
+            def reset(self, ids, frames):
+                self.f = frames.clone()
+                self.init_f = frames.clone()
+
+            def state(self):
+                return (self.pose[:, :3], so3_exp(torch.zeros(self.N, 3)), self.vel[:, :3], self.vel[:, 3:],
+                        self.motion.q[self.f], self.motion.qd[self.f])
+
+            def observe(self):
+                return torch.zeros(self.N, self.mdp.obs_dim)
+
+            def step(self, a):
+                self.f = self.f + 1
+                self.done_eval |= self.f >= self.motion.clip_end[self.motion.clip_id[self.init_f]]
+                return dict(r=torch.full((self.N,), MAX_STEP_REWARD))
+
+        class Actor:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def to(self, dev):
+                return self
+
+            def load_state_dict(self, state):
+                pass
+
+            def eval(self):
+                pass
+
+            def __call__(self, hist, goal):
+                f = instances[-1].f
+                torch.testing.assert_close(goal, source.goal(f, 2), atol=0, rtol=0)
+                commands.append(goal.clone())
+                return torch.zeros(len(f), 1)
+
+        with TemporaryDirectory() as tmp, ExitStack() as stack:
+            record = str(Path(tmp) / 'traj.npz')
+            robot = SimpleNamespace(num_joints=1, sensing=None, default_joint_pos_list=lambda: [0.])
+            stack.enter_context(patch('sys.argv', ['evaluateran', '--run_dir', tmp, '--ckpt', 'dummy.pt',
+                                                  '--record', record, '--episodes', '12', '--seed', '4']))
+            stack.enter_context(patch('blinkmimic.robot.get_robot', return_value=robot))
+            stack.enter_context(patch('blinkmimic.kinematics.Kinematics', return_value=RootKinematics()))
+            stack.enter_context(patch('blinkmimic.motion.MotionLib.from_dir', return_value=source))
+            robot.motion_dir = ''
+            from blinkmimic.sensing import SensingCfg
+            robot.sensing = SensingCfg()
+            stack.enter_context(patch('blinkmimic.dr.XiLayout', return_value=SimpleNamespace(dim=1)))
+            stack.enter_context(patch('blinkmimic.env.make_sim', return_value=None))
+            stack.enter_context(patch('blinkmimic.env.TrackingSim', Env))
+            stack.enter_context(patch('blinkmimic.networks.Policy', Actor))
+            stack.enter_context(patch('blinkmimic.networks.policy_kwargs', return_value={}))
+            stack.enter_context(patch('torch.load', return_value=dict(args=dict(goal_frames=2, hist=1), pi={})))
+            # Run the real CLI/evaluation/recording logic with CPU simulation and policy doubles.
+            for name in ('tensor', 'zeros', 'ones', 'arange'):
+                original = getattr(torch, name)
+                def cpu_factory(*args, _fn=original, **kwargs):
+                    if kwargs.get('device') == 'cuda:0':
+                        kwargs['device'] = 'cpu'
+                    return _fn(*args, **kwargs)
+                stack.enter_context(patch.object(torch, name, cpu_factory))
+            output = io.StringIO()
+            with redirect_stdout(output), self.assertRaises(SystemExit) as ended:
+                main()
+            self.assertEqual(ended.exception.code, 0)
+            result = json.loads(output.getvalue())
+            self.assertAlmostEqual(result['norm_return'], 1, places=6)
+            self.assertAlmostEqual(result['norm_return_framew'], 1, places=6)
+            self.assertEqual(sum(result['per_clip_count'].values()), 12)
+            self.assertTrue(commands)
+            d = dict(np.load(record))
+            np.testing.assert_array_equal(d['ref_root_p'], source.root_p.numpy())
+            np.testing.assert_array_equal(d['f'][0], d['start_frame'])
+            np.testing.assert_array_equal(source.clip_id[d['start_frame']].numpy(), d['rollout_clip'])
+            self.assertEqual(d['root_p'].shape[1], 12)
+
+    def test_ghost_rotates_about_sampled_frame_without_modifying_expert(self):
+        import importlib.util
+        from pathlib import Path
+        import numpy as np
+        spec = importlib.util.spec_from_file_location('render_ran', Path(__file__).with_name('render_ran.py'))
+        renderer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(renderer)
+        d = dict(ref_root_p=self.source.root_p.numpy().copy(), ref_root_R=self.source.root_R.numpy().copy(),
+                 start_frame=np.array([2, 5]), yaw=np.array([1.2, -1.4]))
+        original = d['ref_root_p'].copy()
+        for c, start in enumerate(d['start_frame']):
+            p0, R0 = renderer.ghost_pose(d, int(start), c)
+            np.testing.assert_allclose(p0, original[start])
+            yaw = d['yaw'][c]
+            Y = np.array([[np.cos(yaw), -np.sin(yaw), 0], [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]])
+            p, R = renderer.ghost_pose(d, int(start+1), c)
+            np.testing.assert_allclose(p, original[start] + Y @ (original[start+1] - original[start]))
+            np.testing.assert_allclose(R, Y @ d['ref_root_R'][start+1])
+        np.testing.assert_array_equal(d['ref_root_p'], original)
+        del d['start_frame']  # legacy recordings are already transformed
+        p, R = renderer.ghost_pose(d, 2, 0)
+        np.testing.assert_array_equal(p, original[2])
 
 
 if __name__ == '__main__':

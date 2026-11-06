@@ -1,64 +1,60 @@
-"""Evaluate checkpoints at random headings, with reference motion in the same world frame.
+"""Evaluate from random motions, frames and robot headings, keeping original actor commands.
 
 python -m blinkmimic.evaluateran --run_dir logs/<run> --ckpt <checkpoint> --record traj.npz
-Yaw offsets are sampled once per clip/repeat about its first root position, preserving height,
-tilt and local velocities. Evaluation otherwise retains evaluate.py's deterministic reset.
-The saved reference is already transformed; render it with tools/render_ran.py.
+Each rollout samples a clip, a frame before its last frame, and a robot yaw offset. Expert motion,
+commands and observation references are untouched, as in training. Ghost alignment is display-only;
+render_ran.py uses the saved initial frame and yaw to rotate the reference about that reset position.
 """
 
 from __future__ import annotations
 
-import copy
 import math
 
 import torch
 
 from .motion import MotionLib
-from .rotations import mv3, so3_exp
+from .rotations import mat_to_quat, mv3, so3_exp
 
 
 @torch.no_grad()
-def random_yaw_motion(source: MotionLib, repeats: int, half: float) -> tuple[MotionLib, torch.Tensor]:
-    """Independent yaw per rollout; duplicate clip/frame/bin metadata for repeated evaluations.
+def sample_starts(motion: MotionLib, n: int, half: float, seed: int):
+    """Uniform clip, then uniform frame with at least one transition, then independent robot yaw.
 
-    Transform p as p0 + Y (p - p0), R as Y R, and world velocities as Y v / Y w.
-    Local goals, joints, contact labels and tilt are unchanged. The source is never modified.
+    A private generator keeps the same evaluation starts across checkpoints and does not depend on
+    policy initialization or simulation RNG. The final frame cannot start a transition.
     """
-    if repeats < 1 or not 0 <= half <= math.pi:
-        raise ValueError("repeats must be positive and yaw half-range must be in [0, pi]")
-    m = copy.copy(source)
-    C, F, B = len(source.names), source.num_frames, source.num_bins
-    dev = source.root_p.device
-    # Keep the random stream identical for yaw=0, useful for controlled comparisons.
-    yaw = torch.empty(C * repeats, device=dev).uniform_(-half, half)
-    rot = torch.zeros(C * repeats, 3, device=dev)
+    if n < 1 or not 0 <= half <= math.pi:
+        raise ValueError("rollout count must be positive and yaw half-range must be in [0, pi]")
+    valid = (motion.clip_len >= 2).nonzero().flatten()
+    if not len(valid):
+        raise ValueError("evaluation needs at least one motion with two frames")
+    dev = motion.root_p.device
+    rng = torch.Generator(device=dev).manual_seed(seed)
+    clips = valid[torch.randint(len(valid), (n,), device=dev, generator=rng)]
+    frames = motion.clip_start[clips] + (torch.rand(n, device=dev, generator=rng)
+                                       * (motion.clip_len[clips] - 1)).long()
+    yaw = torch.empty(n, device=dev).uniform_(-half, half, generator=rng)
+    return clips, frames, yaw
+
+
+@torch.no_grad()
+def reset_random_yaw(env, frames: torch.Tensor, yaw: torch.Tensor):
+    """Reset from the untouched expert frame, rotating only the robot as in training.
+
+    Reference frames, command generation and observation references remain unchanged. Save the
+    robot's rotated reset pose so reward compares each trajectory in its own initial frame.
+    """
+    ids = torch.arange(len(frames), device=frames.device)
+    env.reset(ids, frames)
+    p, R, v, w, _, _ = env.motion.ref_state(frames)
+    rot = torch.zeros_like(p)
     rot[:, 2] = yaw
     Y = so3_exp(rot)
-    repeat = lambda x: x.repeat(repeats, *([1] * (x.ndim - 1)))
-    m.names = source.names * repeats
-    m.num_frames, m.num_bins = F * repeats, B * repeats
-    frame_offset = torch.arange(repeats, device=dev).repeat_interleave(C) * F
-    m.clip_start = repeat(source.clip_start) + frame_offset
-    m.clip_end = repeat(source.clip_end) + frame_offset
-    m.clip_len = repeat(source.clip_len)
-    m.clip_id = repeat(source.clip_id) + torch.arange(repeats, device=dev).repeat_interleave(F) * C
-    m.bin_start = repeat(source.bin_start) + torch.arange(repeats, device=dev).repeat_interleave(B) * F
-    m.bin_clip = repeat(source.bin_clip) + torch.arange(repeats, device=dev).repeat_interleave(B) * C
-    m.frame_bin = repeat(source.frame_bin) + torch.arange(repeats, device=dev).repeat_interleave(F) * B
-    origin = repeat(source.root_p[source.clip_start])[m.clip_id]
-    A = Y[m.clip_id]
-    m.root_p = origin + mv3(A, repeat(source.root_p) - origin)
-    m.root_R = A @ repeat(source.root_R)
-    m.body_p = origin[:, None] + mv3(A[:, None], repeat(source.body_p) - origin[:, None])
-    m.body_R = A[:, None] @ repeat(source.body_R)
-    for name in ("root_v", "root_w", "body_v", "body_w"):
-        x = repeat(getattr(source, name))
-        setattr(m, name, mv3(A if x.ndim == 2 else A[:, None], x))
-    for name in ("q", "qd", "root_v_local", "root_w_local", "root_gz"):
-        setattr(m, name, repeat(getattr(source, name)))
-    if hasattr(source, "ref_contact"):
-        m.ref_contact = repeat(source.ref_contact)
-    return m, yaw
+    pose = torch.cat((p, mat_to_quat(Y @ R)), -1)
+    env.robot.write_root_link_pose_to_sim(torch.cat((p + env.scene.env_origins, pose[:, 3:]), -1), env_ids=ids)
+    env.robot.write_root_link_velocity_to_sim(torch.cat((mv3(Y, v), mv3(Y, w)), -1), env_ids=ids)
+    env.init_root.copy_(pose)
+
 
 
 def main():
@@ -80,14 +76,15 @@ def main():
     parser.add_argument("--dr_from", type=str, default=None, help="evaluate under this robot's training randomization ('self': own)")
     parser.add_argument("--dr_parts", type=str, default="all", choices=["all", "dynamics", "sensing"],
                         help="with --dr_from: take only its simulator randomization or only its sensing")
-    parser.add_argument("--repeats", type=int, default=1, help="rollouts per clip")
+    parser.add_argument("--episodes", type=int, default=1, help="independent random motion/frame/yaw rollouts")
+    parser.add_argument("--repeats", type=int, default=1, help="multiply --episodes by this count")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--yaw_degrees", type=float, default=90.0, help="uniform yaw offset half-range (degrees; 0 disables)")
     args = parser.parse_args()
     if not 0 <= args.yaw_degrees <= 180:
         parser.error("--yaw_degrees must be between 0 and 180")
-    if args.repeats < 1:
-        parser.error("--repeats must be positive")
+    if args.repeats < 1 or args.episodes < 1:
+        parser.error("--episodes and --repeats must be positive")
 
     import dataclasses
     import re
@@ -138,10 +135,9 @@ def main():
     kin = Kinematics(robot, dev)
     motion = MotionLib.from_dir(args.motion_dir or robot.motion_dir, robot, kin, dev)
     C = len(motion.names)
-    motion, yaw = random_yaw_motion(motion, args.repeats, math.radians(args.yaw_degrees))
     mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)
-    N = C * args.repeats
-    clip_of = torch.arange(N, device=dev)
+    N = args.episodes * args.repeats
+    clip_of, start_frames, yaw = sample_starts(motion, N, math.radians(args.yaw_degrees), args.seed)
 
 
     @torch.no_grad()
@@ -154,13 +150,11 @@ def main():
                     dec_hidden=widths("dec_hidden", "2048,1024,512,256"), **policy_kwargs(a_, robot)).to(dev)  # fmt: skip
         pi.load_state_dict(ck["pi"])
         pi.eval()
-        ids = torch.arange(N, device=dev)
         env.done_eval[:] = False
         env.failed_eval[:] = False
-        env.reset(ids, motion.clip_start[clip_of].clone())
+        reset_random_yaw(env, start_frames, yaw)
         clip_end = motion.clip_end[clip_of]
         ret = torch.zeros(N, device=dev)
-        steps = torch.zeros(N, device=dev)
         hist = None
         traj = {"root_p": [], "root_quat": [], "q": [], "f": [], "alive": []}
         while not bool(env.done_eval.all()):
@@ -176,26 +170,36 @@ def main():
                 traj["q"].append(S[4].cpu()), traj["f"].append(env.f.cpu()), traj["alive"].append(alive.cpu())
             out = env.step(a)
             ret += torch.where(alive, out["r"], 0.0)
-            steps += alive.float()
             env.f = torch.minimum(env.f, clip_end - 1)  # finished clips keep stepping; keep f+1 in range
-        clip_len = motion.clip_len[clip_of]
-        norm = ret / ((clip_len - 1).float() * MAX_STEP_REWARD)
-        norm_c = norm.view(args.repeats, C).mean(0)
-        fail_c = env.failed_eval.view(args.repeats, C).float().mean(0)
+        remaining = clip_end - start_frames
+        norm = ret / (remaining.float() * MAX_STEP_REWARD)
+        counts = torch.zeros(C, device=dev).index_add_(0, clip_of, torch.ones(N, device=dev))
+        norm_c = torch.zeros(C, device=dev).index_add_(0, clip_of, norm) / counts.clamp(min=1)
+        fail_c = torch.zeros(C, device=dev).index_add_(0, clip_of, env.failed_eval.float()) / counts.clamp(min=1)
+        sampled = (counts > 0).nonzero().flatten().tolist()
         res = {
             "norm_return": norm.mean().item(),
-            "norm_return_framew": (ret.sum() / ((clip_len - 1).sum() * MAX_STEP_REWARD)).item(),
+            "norm_return_framew": (ret.sum() / (remaining.sum() * MAX_STEP_REWARD)).item(),
             "n_failed": int(env.failed_eval.sum().item()),
             "fail_rate": env.failed_eval.float().mean().item(),
-            "failed": [motion.names[i] for i in (fail_c > 0).nonzero().flatten().tolist()],
+            "failed": [motion.names[i] for i in sampled if fail_c[i] > 0],
             "yaw_degrees": args.yaw_degrees,
             "seed": args.seed,
-            "per_clip": {motion.names[i]: round(norm_c[i].item(), 4) for i in range(C)},
-            "per_clip_fail_rate": {motion.names[i]: round(fail_c[i].item(), 3) for i in range(C) if fail_c[i] > 0},
+            "n_rollouts": N,
+            "per_clip": {motion.names[i]: round(norm_c[i].item(), 4) for i in sampled},
+            "per_clip_count": {motion.names[i]: int(counts[i].item()) for i in sampled},
+            "per_clip_fail_rate": {motion.names[i]: round(fail_c[i].item(), 3) for i in sampled},
+            "starts": [{"motion": motion.names[c], "frame": int(f - motion.clip_start[c]), "yaw": float(y)}
+                       for c, f, y in zip(clip_of.tolist(), start_frames.tolist(), yaw.tolist())],
         }
         if record:
-            np.savez_compressed(record, names=np.array(motion.names[:C]), yaw=yaw.cpu().numpy(),
-                                rollout_clip=(clip_of % C).cpu().numpy(), rollout_repeat=(clip_of // C).cpu().numpy(), **{k: torch.stack(v).numpy() for k, v in traj.items()},
+            clip_cpu = clip_of.cpu().numpy()
+            seen = np.zeros(C, dtype=np.int64)
+            repeat_of = np.empty(N, dtype=np.int64)
+            for i, c in enumerate(clip_cpu):
+                repeat_of[i], seen[c] = seen[c], seen[c] + 1
+            np.savez_compressed(record, names=np.array(motion.names), yaw=yaw.cpu().numpy(),
+                                start_frame=start_frames.cpu().numpy(), rollout_clip=clip_cpu, rollout_repeat=repeat_of, **{k: torch.stack(v).numpy() for k, v in traj.items()},
                                 ref_root_p=motion.root_p.cpu().numpy(), ref_root_R=motion.root_R.cpu().numpy(), ref_q=motion.q.cpu().numpy(),
                                 clip_start=motion.clip_start.cpu().numpy(), clip_len=motion.clip_len.cpu().numpy())  # fmt: skip
         return res
@@ -208,10 +212,10 @@ def main():
         res = evaluate(env, ck, args.record)
         print(json.dumps({k: v for k, v in res.items() if k != "per_clip"}, indent=1))
         if args.record is None and (args.dr_from or args.repeats > 1):
-            tag = f"yaw-{args.yaw_degrees:g}_dr-{args.dr_from or 'none'}{'' if args.dr_parts == 'all' else '-' + args.dr_parts}_x{args.repeats}"
+            tag = f"random-{N}_seed-{args.seed}_yaw-{args.yaw_degrees:g}_dr-{args.dr_from or 'none'}{'' if args.dr_parts == 'all' else '-' + args.dr_parts}_x{args.repeats}"
             json.dump(res, open(args.ckpt.replace(".pt", f"_eval_{tag}.json"), "w"), indent=1)
         sys.exit(0)
-    out_csv = os.path.join(args.run_dir, "eval_yaw.csv")
+    out_csv = os.path.join(args.run_dir, "eval_random.csv")
     done = set()
     if os.path.exists(out_csv):
         done = {int(l.split(",")[0]) for l in open(out_csv).read().strip().splitlines()[1:]}
@@ -227,8 +231,8 @@ def main():
             res = evaluate(env, ck)
             line = f"{it},{ck['wall_time'] / 3600:.4f},{ck['saved_at']},{time.strftime('%Y-%m-%d %H:%M:%S')},{res['norm_return']:.4f},{res['norm_return_framew']:.4f},{res['n_failed']},{'|'.join(res['failed'])}\n"
             open(out_csv, "a").write(line)
-            json.dump(res, open(c.replace(".pt", "_eval_yaw.json"), "w"), indent=1)
-            print(f"[eval yaw] it {it} ({ck['wall_time'] / 3600:.2f} h): norm return {res['norm_return']:.4f}, failed {res['n_failed']}/{C} ({time.time() - t0:.0f}s)", flush=True)
+            json.dump(res, open(c.replace(".pt", "_eval_random.json"), "w"), indent=1)
+            print(f"[eval yaw] it {it} ({ck['wall_time'] / 3600:.2f} h): norm return {res['norm_return']:.4f}, failed {res['n_failed']}/{N} ({time.time() - t0:.0f}s)", flush=True)
             done.add(it)
         if not args.watch:
             break

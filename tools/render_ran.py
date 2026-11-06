@@ -1,7 +1,8 @@
 """Render recorded evaluation trajectories (python -m blinkmimic.evaluateran --record) with MuJoCo (EGL).
 
 The simulated robot is drawn solid; the reference motion is a translucent ghost.
-The saved reference already includes the rollout's initial yaw transform. Keep its full trajectory
+For random-start recordings, rotate the original reference about the sampled reset position.
+Older recordings already contain the transformed reference. Keep its full trajectory
 by default so position drift stays visible; --anchor_ghost follows the robot's current xy instead.
 Usage: MUJOCO_GL=egl python tools/render_ran.py traj.npz out.mp4 --robot g1 --clips dance1_subject1 jumps1_subject1 --seconds 12
 """
@@ -55,11 +56,24 @@ def two_robot_xml(robot: RobotSpec, clean: bool = False, ghost_alpha: float = 0.
     return xml
 
 
+def ghost_pose(d, f: int, rollout: int):
+    """Display-only transform; actor commands and recorded expert frames remain original."""
+    p, R = d["ref_root_p"][f], d["ref_root_R"][f]
+    if "start_frame" not in d:  # older random-heading evaluator saved transformed references
+        return p, R
+    yaw = float(d["yaw"][rollout])
+    c, s = np.cos(yaw), np.sin(yaw)
+    Y = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+    p0 = d["ref_root_p"][int(d["start_frame"][rollout])]
+    return p0 + Y @ (p - p0), Y @ R
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("traj")
     ap.add_argument("out")
     ap.add_argument("--robot", type=str, default="g1")
+    ap.add_argument("--rollout", type=int, default=None, help="render one recorded rollout by its zero-based index")
     ap.add_argument("--repeat", type=int, default=0, help="which recorded repeat to render (zero-based)")
     ap.add_argument("--clips", nargs="*", default=None)
     ap.add_argument("--seconds", type=float, default=10.0)
@@ -99,17 +113,29 @@ def main():
     cam = mujoco.MjvCamera()
     cam.distance, cam.azimuth, cam.elevation = a.distance, a.azimuth, a.elevation
     font = ImageFont.load_default(size=22) if hasattr(ImageFont, "load_default") else None
-    clips = a.clips or names
+    if a.rollout is not None:
+        if not 0 <= a.rollout < d["root_p"].shape[1]:
+            ap.error("--rollout is outside the recorded range")
+        rollouts = [a.rollout]
+    else:
+        clips = a.clips or [names[int(i)] for i in dict.fromkeys(d["rollout_clip"].tolist())
+                            if np.any((d["rollout_clip"] == i) & (d["rollout_repeat"] == a.repeat))]
+        rollouts = []
+        for clip in clips:
+            if clip not in names:
+                ap.error(f"unknown clip: {clip}")
+            match = np.flatnonzero((d["rollout_clip"] == names.index(clip)) & (d["rollout_repeat"] == a.repeat))
+            if not len(match):
+                ap.error(f"clip {clip} has no recorded repeat {a.repeat}")
+            rollouts.append(int(match[0]))
     ff = subprocess.Popen(
         ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{a.width}x{a.height}", "-r", str(a.fps),
          "-i", "-", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20", a.out],
         stdin=subprocess.PIPE,
     )  # fmt: skip
     stride = int(round(50 / a.fps))
-    for clip in clips:
-        if clip not in names:
-            raise ValueError(f"unknown clip: {clip}")
-        c = int(np.flatnonzero((d["rollout_clip"] == names.index(clip)) & (d["rollout_repeat"] == a.repeat))[0])
+    for c in rollouts:
+        clip = names[int(d["rollout_clip"][c])]
         T = d["root_p"].shape[0]
         alive = d["alive"][:, c]
         t0 = int(a.start * 50)
@@ -124,10 +150,11 @@ def main():
             data.qpos[0:3] = d["root_p"][tt, c]
             data.qpos[3:7] = d["root_quat"][tt, c]
             data.qpos[7:nq] = d["q"][tt, c]
-            data.qpos[nq : nq + 3] = d["ref_root_p"][f]
+            ref_p, ref_R = ghost_pose(d, f, c)
+            data.qpos[nq : nq + 3] = ref_p
             if a.anchor_ghost:  # optional display anchor; retain the recorded yaw
                 data.qpos[nq : nq + 2] = d["root_p"][tt, c][:2]
-            data.qpos[nq + 3 : nq + 7] = _mat_to_quat(d["ref_root_R"][f])
+            data.qpos[nq + 3 : nq + 7] = _mat_to_quat(ref_R)
             data.qpos[nq + 7 : 2 * nq] = d["ref_q"][f]
             mujoco.mj_kinematics(model, data)
             cam.lookat[:] = [data.qpos[0], data.qpos[1], lookat_z]
