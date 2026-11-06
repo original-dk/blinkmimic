@@ -149,6 +149,8 @@ class TrackingSim:
 
         # ---- episode bookkeeping ----
         self.f = torch.zeros(self.N, dtype=torch.long, device=dev)
+        self.init_root = torch.zeros(self.N, 7, device=dev)  # robot reset pose, including reset noise
+        self.init_f = torch.zeros(self.N, dtype=torch.long, device=dev)  # sampled expert frame, before noise
         self.ep_step = torch.zeros(self.N, dtype=torch.long, device=dev)
         self.a_prev = torch.zeros(self.N, self.J, device=dev)
         self.start_bin = torch.zeros(self.N, dtype=torch.long, device=dev)
@@ -245,6 +247,8 @@ class TrackingSim:
         self.robot.write_joint_position_to_sim(q, env_ids=env_ids)
         self.robot.write_joint_velocity_to_sim(qd, env_ids=env_ids)
         self.robot.set_joint_position_target(q, env_ids=env_ids)
+        self.init_root[env_ids] = torch.cat((p, mat_to_quat(R)), -1)
+        self.init_f[env_ids] = frames
         self.f[env_ids] = frames
         self.ep_step.index_fill_(0, env_ids, 0)  # index_fill_: no host sync (see _dev_scalar)
         self.a_prev.index_fill_(0, env_ids, 0.0)
@@ -316,6 +320,8 @@ class TrackingSim:
         qpos[:, idx.joint_q_adr] = torch.where(d1, q, qpos[:, idx.joint_q_adr])
         qvel[:, idx.joint_v_adr] = torch.where(d1, qd, qvel[:, idx.joint_v_adr])
         ed.joint_pos_target.copy_(torch.where(d1, q, ed.joint_pos_target))
+        self.init_root.copy_(torch.where(d1, torch.cat((p, mat_to_quat(R)), -1), self.init_root))
+        self.init_f.copy_(torch.where(d, frames, self.init_f))
         self.f.copy_(torch.where(d, frames, self.f))
         self.ep_step.masked_fill_(d, 0)
         self.a_prev.masked_fill_(d1, 0.0)
@@ -412,6 +418,7 @@ class TrackingSim:
         xi = self.xi.clone()
         a_prev = self.a_prev.clone()
         ep_step = self.ep_step.clone()
+        init_root, init_f = self.init_root.clone(), self.init_f.clone()
         target = self.default_q + xi[:, 1 : 1 + self.J] + self.alpha * a
         self.robot.set_joint_position_target(target)
         for _ in range(DECIMATION):
@@ -424,13 +431,14 @@ class TrackingSim:
                                                           PHYSICS_DT, noise=self.randomize)  # fmt: skip
         S1 = self.state()
         f1 = f + 1
-        r, terms = self.mdp.reward(S1, f1, a, a_prev, terms=True)
+        r, terms = self.mdp.reward(S1, f1, a, a_prev, terms=True, init_root=init_root, init_f=init_f)
         term = self.mdp.termination(S1, f1)
         clip_end = self.motion.clip_end[self.motion.clip_id[f]]
         timeout = (f1 >= clip_end) | (ep_step + 1 >= self.max_episode_steps)
         done = term | timeout
         out = {
             "s": flatten_state(S), "a": a.clone(), "a_prev": a_prev, "f": f, "s1": flatten_state(S1), "r": r,
+            "init_root": init_root, "init_f": init_f,
             "term": term, "done": done, "ep_step": ep_step, "xi": xi, "terms": terms, "cut": done,
         }  # fmt: skip
         if self.pipe.stateful:

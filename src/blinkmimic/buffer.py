@@ -17,6 +17,8 @@ def fields(num_j: int, xi_dim: int, obs_dim: int | None = None, obs_state_dim: i
         "r": ((), torch.float32),
         "f": ((), torch.long),
         "ep_step": ((), torch.int32),
+        "init_root": (7, torch.float32),
+        "init_f": ((), torch.long),
         "done": ((), torch.bool),
         "cut": ((), torch.bool),
     }
@@ -112,6 +114,6 @@ class ReplayBuffer:
         hrows = self._row(age.unsqueeze(-1) - back)
         henv = env.unsqueeze(-1).expand_as(hrows)
         stateful = "o" in self.data
-        start = {k: self.data[k][row, env] for k in ("s", "a_prev", "xi", "f") + (("obs_state",) if stateful else ())}
+        start = {k: self.data[k][row, env] for k in ("s", "a_prev", "xi", "f", "init_root", "init_f") + (("obs_state",) if stateful else ())}
         hist_d = {k: self.data[k][hrows, henv] for k in ("s", "a_prev", "xi", "f") + (("o",) if stateful else ())}
         return start, hist_d

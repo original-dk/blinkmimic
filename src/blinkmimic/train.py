@@ -294,8 +294,9 @@ def _imag_step_sensed(S, o_hist, a_prev, f, xi, xi_n, g, st):
     return S1, a, o_hist, f1, motion.goal(f1, K), st
 
 
-def _reward_term(S, f, a, a_prev):
-    return mdp.reward(S, f, a, a_prev, w_contact=args.contact_reward), mdp.soft_termination(S, f)
+def _reward_term(S, f, a, a_prev, init_root, init_f):
+    return mdp.reward(S, f, a, a_prev, w_contact=args.contact_reward,
+                      init_root=init_root, init_f=init_f), mdp.soft_termination(S, f)
 
 
 def _gae_targets(V, rews, dones):
@@ -460,7 +461,9 @@ def policy_update():
     flat = lambda xs: torch.stack(xs).flatten(0, 1)  # noqa: E731  (H*B, ...)
     S_all = tuple(flat([St[i] for St in Ss]) for i in range(6))
     f_all = flat(Fs)
-    r, d = reward_term(S_all, f_all, flat(As), flat(Aps))
+    init_root = s["init_root"].unsqueeze(0).expand(HZ, -1, -1).flatten(0, 1)
+    init_f = s["init_f"].unsqueeze(0).expand(HZ, -1).flatten()
+    r, d = reward_term(S_all, f_all, flat(As), flat(Aps), init_root, init_f)
     r, d = r.view(HZ, B), d.view(HZ, B)
     v_boot = critic((critic_input_c if args.compile_more else _critic_input)(S, f, xi_n, g))
     # --cuda_graph: survival products as a loop (cumprod's backward reads the host)

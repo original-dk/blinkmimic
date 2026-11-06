@@ -114,12 +114,18 @@ class MDP:
         return o + (2 * torch.rand_like(o) - 1) * self.obs_noise
 
     # ---------------- reward / termination ----------------
-    def reward(self, S, f, a, a_prev, terms: bool = False, w_contact: float = 0.0):
+    def reward(self, S, f, a, a_prev, terms: bool = False, w_contact: float = 0.0,
+               init_root=None, init_f=None):
         """Per-step reward (already multiplied by dt) comparing S with reference frame f.
+
+        ``init_root`` is the robot's reset pose (xyz + wxyz), after reset noise; ``init_f`` is the
+        sampled expert frame, before noise. Root tracking compares displacement and rotation in each
+        initial root frame. Both must be supplied together; omitted context retains absolute tracking
+        for standalone reference playback. Context is per sample, including replay/imagination batches.
 
         ``w_contact`` > 0 adds the InstantTrack contact term: a smooth foot-contact indicator (ankle-roll
         origin below 4.5 cm) matched to the reference's contact state, plus low horizontal foot speed while
-        the reference foot is down. Evaluation keeps ``w_contact = 0``, i.e. the paper's reward."""
+        the reference foot is down. Evaluation keeps ``w_contact = 0``."""
         c, m = self.cfg, self.motion
         p, R, v, w, q, qd = S
         bp, bR, bv, bw = self.kin.forward(p, R, v, w, q, qd)
@@ -131,10 +137,20 @@ class MDP:
         ref_bR = mm3(dR.unsqueeze(-3), m.body_R[f])
         e_pos = ((ref_bp - bp) ** 2).sum(-1).mean(-1)
         e_ori = rot_angle_sq(ref_bR, bR).mean(-1)
-        e_lv = ((m.body_v[f] - bv) ** 2).sum(-1).mean(-1)
-        e_av = ((m.body_w[f] - bw) ** 2).sum(-1).mean(-1)
-        e_rp = ((rp - p) ** 2).sum(-1)
-        e_ro = rot_angle_sq(rR, R)
+        # Velocities in the current root frames, matching the base-velocity convention of the reference.
+        Rt, rRt = R.transpose(-1, -2).unsqueeze(-3), rR.transpose(-1, -2).unsqueeze(-3)
+        e_lv = ((mv3(rRt, m.body_v[f]) - mv3(Rt, bv)) ** 2).sum(-1).mean(-1)
+        e_av = ((mv3(rRt, m.body_w[f]) - mv3(Rt, bw)) ** 2).sum(-1).mean(-1)
+        assert (init_root is None) == (init_f is None), "reset pose and expert frame must be supplied together"
+        if init_root is None:
+            e_rp = ((rp - p) ** 2).sum(-1)
+            e_ro = rot_angle_sq(rR, R)
+        else:
+            p0, R0 = init_root[..., :3], quat_to_mat(init_root[..., 3:7])
+            rp0, rR0 = m.root_p[init_f], m.root_R[init_f]
+            R0t, rR0t = R0.transpose(-1, -2), rR0.transpose(-1, -2)
+            e_rp = ((mv3(rR0t, rp - rp0) - mv3(R0t, p - p0)) ** 2).sum(-1)
+            e_ro = rot_angle_sq(mm3(rR0t, rR), mm3(R0t, R))
         r_track = (
             torch.exp(-e_pos / c.body_pos_std**2)
             + torch.exp(-e_ori / c.body_ori_std**2)
@@ -160,6 +176,9 @@ class MDP:
                 "e_body_pos": e_pos,
                 "e_body_ori": e_ori,
                 "e_root_pos": e_rp,
+                "e_root_ori": e_ro,
+                "e_body_linvel": e_lv,
+                "e_body_angvel": e_av,
                 "action_rate": r_rate,
                 "joint_limit": r_lim,
             }
