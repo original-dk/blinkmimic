@@ -123,7 +123,7 @@ source .venv/bin/activate
 
 ```bash
 PYTHON=python bash scripts/train.sh logs/run_s0 \
-  --seed 0 --iterations 3500 --ckpt_every 100 --xy_range 0 0.1
+  --seed 0 --iterations 3500 --ckpt_every 100 --yaw_degrees 90 --xy_range 0 0.1
 ```
 
 This uses `PRESET[main]`, writes logs to `logs/run_s0`, and saves policy checkpoints such as
@@ -131,9 +131,10 @@ This uses `PRESET[main]`, writes logs to `logs/run_s0`, and saves policy checkpo
 
 Training samples a motion time bin using return/failure statistics, then a frame inside that bin. Each reset
 adds an independent, continuous uniform robot yaw offset in **[-90°, +90°]**, on top of the original reset noise.
-The world linear and angular velocities rotate with that yaw. The range is configured by
-`DomainRandCfg.reset_yaw` in [`src/blinkmimic/dr.py`](src/blinkmimic/dr.py), in radians; `0` disables this extra
-rotation. There is currently no training `--yaw_degrees` flag.
+The world linear and angular velocities rotate with that yaw. Use `--yaw_degrees 90` to set this half-range,
+`--yaw_degrees 30` for [-30°, +30°], or `--yaw_degrees 0` to disable the extra yaw rotation. Omitting the flag
+preserves `DomainRandCfg.reset_yaw` in [`src/blinkmimic/dr.py`](src/blinkmimic/dr.py), whose default is pi/2
+radians (90°). The existing small `reset_rot` noise remains enabled even when this extra yaw rotation is disabled.
 
 Training also adds independent world-X/Y translations, each uniform in **[0, 0.1] meters**, matching the
 reference initialization. This is added to the existing `reset_pos` noise; it does not add a new Z offset.
