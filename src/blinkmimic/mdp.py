@@ -20,13 +20,13 @@ def state_dim(J: int) -> int:
 
 
 def obs_dim(J: int) -> int:
-    return J + J + 3 + 3 + J + 6
+    return 3 * J + 6
 
 
 def obs_scale(J: int) -> torch.Tensor:
     # normalization of the obs before the policy (qd and angular velocity are large)
     return torch.cat(
-        (torch.ones(J), torch.full((J,), 0.1), torch.full((3,), 0.25), torch.ones(3), torch.ones(J), torch.ones(6))
+        (torch.ones(J), torch.full((J,), 0.1), torch.full((3,), 0.25), torch.ones(3), torch.ones(J))
     )
 
 
@@ -91,13 +91,12 @@ class MDP:
 
     # ---------------- observation ----------------
     def obs(self, S, a_prev, xi, f) -> torch.Tensor:
-        """Noise-free proprioceptive observation (+ reference-relative root orientation)."""
+        """Noise-free proprioception: joints, local angular velocity, gravity and previous action."""
         p, R, v, w, q, qd = S
         Rt = R.transpose(-1, -2)
         dq0 = xi[..., 1 : 1 + q.shape[-1]]
         g_b = -R[..., 2, :]  # R^T (0,0,-1)
-        rel = mat_to_6d(mm3(Rt, self.motion.root_R[f]))
-        return torch.cat((q - self.default_q - dq0, qd, mv3(Rt, w), g_b, a_prev, rel), -1)
+        return torch.cat((q - self.default_q - dq0, qd, mv3(Rt, w), g_b, a_prev), -1)
 
     def add_noise(self, o: torch.Tensor) -> torch.Tensor:
         return o + (2 * torch.rand_like(o) - 1) * self.obs_noise

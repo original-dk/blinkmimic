@@ -5,13 +5,13 @@ goal features of the next K frames), so any motion file (*.csv) the robot's load
 
 Inputs:  obs_history (1, H, O)  raw observations, oldest first, layout of blinkmimic.mdp.MDP.obs:
                                 q - q0, qd, root angular velocity (root frame), projected gravity,
-                                previous action, reference-relative root orientation (6D)
+                                previous action (3J+6 values per history frame)
          time_step   (1, 1)     reference frame at 50 Hz from the start of the motion (float)
 Outputs: actions (1, J)         joint targets are q0 + action_scale * actions
          joint_pos, joint_vel (1, J), body_pos_w, body_quat_w (wxyz), body_lin_vel_w, body_ang_vel_w
                                 (1, B, .): the reference at time_step (tracked bodies, body 0 = root)
-         next_anchor_quat_w (1, 4)  root orientation at time_step + 1: the reference the next
-                                observation's relative orientation is taken against
+         next_anchor_quat_w (1, 4)  reference root orientation at time_step + 1 (reference output only;
+                                not part of the policy observation)
 PD gains, default pose, action scale and the observation layout are in the ONNX metadata.
 
 Usage: python tools/export_onnx.py --robot g1 --ckpt logs/<run>/ckpt_003500.pt \
@@ -104,8 +104,9 @@ def main():
         "default_joint_pos": fmt(robot.default_joint_pos_list()),
         "action_scale": fmt(robot.action_scale_list()),
         "command_names": "motion",
-        "observation_names": "joint_pos,joint_vel,base_ang_vel,projected_gravity,actions,motion_anchor_ori_b",
+        "observation_names": "joint_pos,joint_vel,base_ang_vel,projected_gravity,actions",
         "observation_history": str(Hh),
+        "observation_dim": str(obs_dim(robot.num_joints)),
         "goal_frames": str(K),
         "control_dt": str(CONTROL_DT),
         "anchor_body_name": robot.tracked_bodies[0],

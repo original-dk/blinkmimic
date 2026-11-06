@@ -39,18 +39,18 @@ class RewardCfg:
     term_tilt: float = 0.8
 
 
-# Active: supplied reference weights and sigma values.
-REWARD_CFG = RewardCfg()
+# Alternative: supplied reference weights and sigma values (the defaults above).
+# REWARD_CFG = RewardCfg()
 
-# Alternative: preceding main training recipe, equivalent for G1's 14 tracked links.
-# Comment out the active assignment above before enabling this block.
-# REWARD_CFG = RewardCfg(
-#     sigma_base_pos=0.3**2, sigma_base_rotation=0.4**2,
-#     sigma_base_lin_vel=1.0**2, sigma_base_ang_vel=3.14**2,
-#     sigma_link_pos=14 * 0.3**2, sigma_link_rotation=14 * 0.4**2,
-#     sigma_link_lin_vel=1.0**2 / 3, sigma_link_ang_vel=3.14**2 / 3,
-#     w_base_pos=0.5, w_base_rotation=0.5, w_base_lin_vel=0.5, w_base_ang_vel=0.5,
-#     w_link_pos=1.0, w_link_rotation=1.0, w_link_lin_vel=1.0, w_link_ang_vel=1.0,
-#     w_dofs_vel=0.0, w_action_rate=-0.1, w_action_magnitude=0.0, w_joint_limit=-2.0,
-#     w_contact=0.25,
-# )
+# Active: preceding main training recipe, equivalent for G1's 14 tracked links.
+# Keep only one REWARD_CFG assignment active.
+REWARD_CFG = RewardCfg(
+    sigma_base_pos=0.3**2, sigma_base_rotation=0.4**2,
+    sigma_base_lin_vel=1.0**2, sigma_base_ang_vel=3.14**2,
+    sigma_link_pos=14 * 0.3**2, sigma_link_rotation=14 * 0.4**2,
+    sigma_link_lin_vel=1.0**2 / 3, sigma_link_ang_vel=3.14**2 / 3,
+    w_base_pos=0.5, w_base_rotation=0.5, w_base_lin_vel=0.5, w_base_ang_vel=0.5,
+    w_link_pos=1.0, w_link_rotation=1.0, w_link_lin_vel=1.0, w_link_ang_vel=1.0,
+    w_dofs_vel=0.0, w_action_rate=-0.1, w_action_magnitude=0.0, w_joint_limit=-2.0,
+    w_contact=0.25,
+)

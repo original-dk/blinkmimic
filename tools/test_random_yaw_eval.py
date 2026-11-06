@@ -96,10 +96,10 @@ class RandomYawEvaluationTest(unittest.TestCase):
                                 init_root=e.init_root, init_f=e.init_f)
         for k in ('e_root_pos', 'e_root_ori', 'e_body_linvel', 'e_body_angvel'):
             torch.testing.assert_close(terms[k], torch.zeros(2), atol=3e-6, rtol=0)
-        # Observation keeps the original reference too, matching the training path.
-        obs = e.mdp.obs(S, torch.zeros(2, 1), torch.zeros(2, 1), frames)
-        base_obs = e.mdp.obs(self.source.ref_state(frames), torch.zeros(2, 1), torch.zeros(2, 1), frames)
-        self.assertGreater((obs - base_obs).abs().max().item(), .1)
+        # Proprioceptive history has no reference-relative orientation; yaw-only reset preserves it.
+        obs = e.mdp.obs(S, torch.zeros(2, 1), torch.zeros(2, 2), frames)
+        base_obs = e.mdp.obs(self.source.ref_state(frames), torch.zeros(2, 1), torch.zeros(2, 2), frames)
+        torch.testing.assert_close(obs, base_obs, atol=1e-6, rtol=1e-5)
 
     def test_translation_and_yaw_reset_keep_commands_and_relative_position_reward(self):
         e = self.make_env()

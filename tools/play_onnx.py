@@ -24,15 +24,6 @@ from blinkmimic.motion import MotionLib
 from blinkmimic.robot import get_robot
 
 
-def quat_to_mat(q: np.ndarray) -> np.ndarray:
-    w, x, y, z = q / np.linalg.norm(q)
-    return np.array([
-        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
-        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
-        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
-    ])  # fmt: skip
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("onnx")
@@ -56,7 +47,6 @@ def main():
     env.failed_eval[:] = False
     env.reset(torch.arange(1, device=dev), motion.clip_start.clone())
 
-    ref_quat = vec("anchor_quat_w_init")
     a_prev = np.zeros(robot.num_joints, dtype=np.float32)
     hist, ret, obs_err = None, 0.0, 0.0
     while not bool(env.done_eval.all()):
@@ -66,8 +56,7 @@ def main():
         else:
             # sensors: joint encoders, root attitude and gyro (root frame)
             _, R, _, w, q, qd = (x[0].cpu().numpy() for x in env.state())
-            R_rel = R.T @ quat_to_mat(ref_quat)
-            o = np.concatenate((q - q0, qd, R.T @ w, -R[2], a_prev, R_rel[:, :2].reshape(6))).astype(np.float32)
+            o = np.concatenate((q - q0, qd, R.T @ w, -R[2], a_prev)).astype(np.float32)
             obs_err = max(obs_err, float(np.abs(o - sim_o).max()))
         hist = np.repeat(o[None], H, 0) if hist is None else np.concatenate((hist[1:], o[None]))
         out = dict(zip([x.name for x in sess.get_outputs()],
@@ -77,7 +66,7 @@ def main():
         r = env.step(torch.from_numpy(act).to(dev).unsqueeze(0))["r"].item()
         ret += r if alive else 0.0
         env.f = torch.minimum(env.f, motion.clip_end - 1)
-        a_prev, ref_quat = act, out["next_anchor_quat_w"][0]
+        a_prev = act
     norm = ret / ((motion.clip_len[0].item() - 1) * MAX_STEP_REWARD)
     print(f"{meta['motion']}: norm return {norm:.4f}, failed {bool(env.failed_eval.item())}"
           + ("" if robot.sensing.stateful else f", max |obs - simulator obs| {obs_err:.2e}"))  # fmt: skip

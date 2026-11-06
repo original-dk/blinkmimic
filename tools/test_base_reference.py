@@ -106,7 +106,7 @@ class BaseReferenceTest(unittest.TestCase):
             + c.w_dofs_vel * torch.exp(-e['e_joint_vel'] / c.sigma_dofs_vel)
         )
         torch.testing.assert_close(r, expected * CONTROL_DT)
-        self.assertAlmostEqual(MAX_STEP_REWARD, 3 * CONTROL_DT)
+        self.assertAlmostEqual(MAX_STEP_REWARD, 6 * CONTROL_DT)
 
     def test_local_velocity_gradients_eager_and_compiled(self):
         x = self.fixture

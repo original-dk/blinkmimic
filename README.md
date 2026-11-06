@@ -122,12 +122,12 @@ source .venv/bin/activate
 ### 1. Train with relative reset rewards and random robot yaw/position
 
 ```bash
-PYTHON=python bash scripts/train.sh logs/run_s0 \
+PYTHON=python bash scripts/train.sh logs/run_no_rel_s0 \
   --seed 0 --iterations 3500 --ckpt_every 100 --yaw_degrees 90 --xy_range 0 0.1
 ```
 
-This uses `PRESET[main]`, writes logs to `logs/run_s0`, and saves policy checkpoints such as
-`logs/run_s0/ckpt_003500.pt`. On a shared GPU, append `--eprobe_async 0` as noted below.
+This uses `PRESET[main]`, writes logs to `logs/run_no_rel_s0`, and saves policy checkpoints such as
+`logs/run_no_rel_s0/ckpt_003500.pt`. On a shared GPU, append `--eprobe_async 0` as noted below.
 
 Training samples a motion time bin using return/failure statistics, then a frame inside that bin. Each reset
 adds an independent, continuous uniform robot yaw offset in **[-90°, +90°]**, on top of the original reset noise.
@@ -142,17 +142,21 @@ Use `--xy_range LOW HIGH` to override `DomainRandCfg.reset_xy`; for example, `--
 horizontal component in [-1, 1] meters. `--xy_range 0 0` disables only this additional translation, while
 preserving the existing small reset noise. The saved robot reset position includes both noise and translation.
 
-Actor commands still come from the original `motion.goal(f, K)`, and observation references remain the original
-expert motion. Root position and orientation rewards compare robot and expert changes in their respective
-initial root frames: the robot uses its pose after reset randomization, and the expert uses the sampled frame
+Actor commands still come from the original `motion.goal(f, K)`. The history contains only proprioception:
+`[q-q0-offset, qd, local angular velocity, projected gravity, previous action]`. The old 6D
+`robot_R.T @ motion_R` observation has been removed from direct and sensed observations, noise, scale and delay
+layouts. Each history frame has `3J+6` values: G1 uses 93 values instead of 99 (930 instead of 990 for 10 frames).
+Future motion commands retain their reference-relative orientation features. Root position and orientation
+rewards compare robot and expert changes in their respective initial root frames: the robot uses its pose after reset randomization, and the expert uses the sampled frame
 before randomization. The reset context is also retained in replay and imagined rollouts.
 
 The critic uses those same four base diffs (position, quaternion rotation, local linear velocity and local
 angular velocity; 12 components total). They replace its previous base height, tilt, raw local velocities
 and absolute root pose errors. Both the actor's value bootstrap and critic targets receive each replay
-sample's reset context. Actor observations, motion commands and world-model inputs retain their current
-layouts. This changes the critic input dimension: start a new training run rather than resuming an older
-`last.pt` with the previous critic layout. Existing policy-only checkpoints remain usable for evaluation.
+sample's reset context. Motion commands and world-model features retain their layouts. Removing history
+`rel` changes the actor input/normalizer dimensions too: use a new training run. Checkpoints and ONNX models
+trained with the former 99-value G1 observation cannot be loaded by the 93-value policy. ONNX export and playback
+use the new proprioception layout; the exported next-reference quaternion remains a reference output only.
 
 Body rewards and critic features share four link diffs, each with shape `(batch, links, 3)`. The reference
 uses its current base frame; the robot uses a hybrid frame with its own current yaw and the reference's
@@ -163,9 +167,9 @@ At a vertical forward axis, where yaw is undefined, hybrid construction uses a z
 ### Reward configuration
 
 All reward settings live in [`src/blinkmimic/reward_cfg.py`](src/blinkmimic/reward_cfg.py). The active
-`REWARD_CFG` uses the supplied reference sigma values and weights. The preceding branch configuration is
-kept as a commented alternative in that same file; keep only one assignment active. There is no reward
-preset flag or automatic checkpoint override. Edit the file and restart training/evaluation to use new values.
+`REWARD_CFG` enables the preceding repository training recipe (the formerly commented configuration,
+calibrated for G1's 14 tracked links). The supplied reference configuration is now commented out; keep only
+one assignment active. There is no reward preset flag or automatic checkpoint override. Edit the file and restart training/evaluation to use new values.
 
 Sigma is used directly in `weight * exp(-error / sigma)`:
 
@@ -177,9 +181,11 @@ The diagnostic `e_body_*` values remain mean per-link squared vector norms for c
 `mdp.reward()` applies the link-count / XYZ factors explicitly to obtain the configured sum/mean rewards.
 No sigma-to-std conversion is needed in the configuration file.
 
-The active positive reward weights sum to 3.0, giving `MAX_STEP_REWARD = 3.0 * CONTROL_DT` (0.06 at 50 Hz).
+The active positive tracking weights sum to 6.0, giving `MAX_STEP_REWARD = 6.0 * CONTROL_DT` (0.12 at 50 Hz).
 This is derived from the active weights and used for training/evaluation normalization and reset sampling.
-Action-rate and action-magnitude penalties are each -0.01; joint-limit and optional contact weights are zero.
+The active action-rate weight is -0.1, joint-limit weight -2.0 and training-only contact weight 0.25;
+action-magnitude and joint-velocity reward weights are zero. The contact bonus is excluded from that tracking
+upper bound, so the imagined reward with contact can exceed a normalized value of 1.
 The optional training-only contact weight is also configured here, rather than through a training flag.
 Optimizer/system presets do not override reward weights.
 
@@ -194,9 +200,9 @@ still require a new training run.
 
 ```bash
 python -m blinkmimic.evaluateran \
-  --run_dir logs/run_s0 \
-  --ckpt logs/run_s0/ckpt_003500.pt \
-  --record logs/run_s0/traj_ran.npz \
+  --run_dir logs/run_no_rel_s0 \
+  --ckpt logs/run_no_rel_s0/ckpt_003500.pt \
+  --record logs/run_no_rel_s0/traj_ran.npz \
   --episodes 20 --yaw_degrees 90 --xy_range 0 0.1 --seed 0
 ```
 
@@ -231,7 +237,7 @@ fixed to isolate translation. Position sampling has a separate reproducible RNG 
 
 ```bash
 MUJOCO_GL=egl python tools/render_ran.py \
-  logs/run_s0/traj_ran.npz logs/run_s0/result_ran.mp4 \
+  logs/run_no_rel_s0/traj_ran.npz logs/run_no_rel_s0/result_ran.mp4 \
   --robot g1 --seconds 10
 ```
 
@@ -248,17 +254,17 @@ reports the root distance in meters; `--clean` and `--white` omit the numerical 
 ```bash
 # Render selected episodes (zero-based indices) in this order.
 MUJOCO_GL=egl python tools/render_ran.py \
-  logs/run_s0/traj_ran.npz logs/run_s0/selected.mp4 \
+  logs/run_no_rel_s0/traj_ran.npz logs/run_no_rel_s0/selected.mp4 \
   --robot g1 --seconds 10 --rollouts 0 2 5
 
 # Render one episode.
 MUJOCO_GL=egl python tools/render_ran.py \
-  logs/run_s0/traj_ran.npz logs/run_s0/episode0.mp4 \
+  logs/run_no_rel_s0/traj_ran.npz logs/run_no_rel_s0/episode0.mp4 \
   --robot g1 --seconds 10 --rollout 0
 
 # Overlay body motion by following the robot's current XY, like the original renderer.
 MUJOCO_GL=egl python tools/render_ran.py \
-  logs/run_s0/traj_ran.npz logs/run_s0/anchored.mp4 \
+  logs/run_no_rel_s0/traj_ran.npz logs/run_no_rel_s0/anchored.mp4 \
   --robot g1 --seconds 10 --anchor_ghost
 ```
 
@@ -274,11 +280,11 @@ yaw or additional XY offset, while using this branch's current MDP/rewards:
 
 ```bash
 python -m blinkmimic.evaluate \
-  --run_dir logs/run_s0 --ckpt logs/run_s0/ckpt_003500.pt \
-  --record logs/run_s0/traj.npz
+  --run_dir logs/run_no_rel_s0 --ckpt logs/run_no_rel_s0/ckpt_003500.pt \
+  --record logs/run_no_rel_s0/traj.npz
 
 MUJOCO_GL=egl python tools/render.py \
-  logs/run_s0/traj.npz logs/run_s0/result.mp4 \
+  logs/run_no_rel_s0/traj.npz logs/run_no_rel_s0/result.mp4 \
   --robot g1 --seconds 10
 ```
 

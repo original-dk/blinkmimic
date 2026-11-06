@@ -27,17 +27,18 @@ class RewardConfigTest(unittest.TestCase):
         self.addCleanup(x.doCleanups)
         return x
 
-    def test_active_weights_and_sigmas_match_supplied_values(self):
+    def test_active_values_match_preceding_repository_configuration(self):
         c = REWARD_CFG
-        for name, expected in dict(sigma_base_pos=.1, sigma_base_rotation=.1, sigma_base_lin_vel=2.,
-                                   sigma_base_ang_vel=2., sigma_link_pos=.5, sigma_link_rotation=1.,
-                                   sigma_link_lin_vel=1., sigma_link_ang_vel=2., sigma_dofs_vel=5.,
-                                   w_base_pos=.5, w_base_rotation=.5, w_base_lin_vel=.2, w_base_ang_vel=.2,
-                                   w_link_pos=.5, w_link_rotation=.6, w_link_lin_vel=.2, w_link_ang_vel=.2,
-                                   w_dofs_vel=.1, w_action_rate=-.01, w_action_magnitude=-.01,
-                                   w_joint_limit=0., w_contact=0.).items():
+        for name, expected in dict(sigma_base_pos=.3**2, sigma_base_rotation=.4**2,
+                                   sigma_base_lin_vel=1., sigma_base_ang_vel=3.14**2,
+                                   sigma_link_pos=14*.3**2, sigma_link_rotation=14*.4**2,
+                                   sigma_link_lin_vel=1/3, sigma_link_ang_vel=3.14**2/3,
+                                   w_base_pos=.5, w_base_rotation=.5, w_base_lin_vel=.5, w_base_ang_vel=.5,
+                                   w_link_pos=1., w_link_rotation=1., w_link_lin_vel=1., w_link_ang_vel=1.,
+                                   w_dofs_vel=0., w_action_rate=-.1, w_action_magnitude=0.,
+                                   w_joint_limit=-2., w_contact=.25).items():
             self.assertEqual(getattr(c, name), expected)
-        self.assertAlmostEqual(MAX_STEP_REWARD, 3*CONTROL_DT)
+        self.assertAlmostEqual(MAX_STEP_REWARD, 6*CONTROL_DT)
 
     def test_every_mdp_uses_the_same_configuration(self):
         x = self.fixture()
@@ -63,17 +64,23 @@ class RewardConfigTest(unittest.TestCase):
         actual, terms = x.mdp.reward(S, x.f, a, prev, terms=True, init_root=init, init_f=x.f)
         dp, dr, dv, dw = self.reference_base(x, S, init)
         _, (lp, lr, lv, lw) = x.reference(S)
-        expected = (.5*torch.exp(-dp.square().sum(-1)/.1) + .5*torch.exp(-dr.square().sum(-1)/.1)
-                    + .2*torch.exp(-dv.square().sum(-1)/2) + .2*torch.exp(-dw.square().sum(-1)/2)
-                    + .5*torch.exp(-lp.square().sum((1,2))/.5) + .6*torch.exp(-lr.square().sum((1,2)))
-                    + .2*torch.exp(-lv.square().mean((1,2))) + .2*torch.exp(-lw.square().mean((1,2))/2)
-                    + .1*torch.exp(-(x.m.qd[x.f]-S[5]).square().sum(-1)/5)
-                    - .01*(a-prev).square().sum(-1) - .01*a.square().sum(-1)) * CONTROL_DT
+        c = REWARD_CFG
+        expected = (c.w_base_pos*torch.exp(-dp.square().sum(-1)/c.sigma_base_pos)
+                    + c.w_base_rotation*torch.exp(-dr.square().sum(-1)/c.sigma_base_rotation)
+                    + c.w_base_lin_vel*torch.exp(-dv.square().sum(-1)/c.sigma_base_lin_vel)
+                    + c.w_base_ang_vel*torch.exp(-dw.square().sum(-1)/c.sigma_base_ang_vel)
+                    + c.w_link_pos*torch.exp(-lp.square().sum((1,2))/c.sigma_link_pos)
+                    + c.w_link_rotation*torch.exp(-lr.square().sum((1,2))/c.sigma_link_rotation)
+                    + c.w_link_lin_vel*torch.exp(-lv.square().mean((1,2))/c.sigma_link_lin_vel)
+                    + c.w_link_ang_vel*torch.exp(-lw.square().mean((1,2))/c.sigma_link_ang_vel)
+                    + c.w_dofs_vel*torch.exp(-(x.m.qd[x.f]-S[5]).square().sum(-1)/c.sigma_dofs_vel)
+                    + c.w_action_rate*(a-prev).square().sum(-1) + c.w_action_magnitude*a.square().sum(-1)
+                    + c.w_joint_limit*terms['joint_limit']) * CONTROL_DT
         torch.testing.assert_close(actual, expected, atol=2e-7, rtol=2e-5)
         torch.testing.assert_close(terms['action_magnitude'], a.square().sum(-1))
         torch.testing.assert_close(terms['e_joint_vel'], (x.m.qd[x.f]-S[5]).square().sum(-1))
 
-    def test_compiled_reward_and_new_penalty_gradients(self):
+    def test_compiled_reward_and_action_gradients(self):
         x = self.fixture()
         S = list(x.state())
         S[5] = S[5].detach().requires_grad_()
@@ -94,17 +101,13 @@ class RewardConfigTest(unittest.TestCase):
                 exec(compile(prefix, str(source), 'exec'), {'__file__': str(source)})
             self.assertEqual(ended.exception.code, 2)
 
-    def test_commented_alternative_remains_usable(self):
+    def test_commented_reference_remains_available(self):
         source = Path(__file__).parents[1]/'src/blinkmimic/reward_cfg.py'
-        text = source.read_text().split('# REWARD_CFG = RewardCfg(', 1)[1]
-        expression = 'RewardCfg(' + '\n'.join(line.removeprefix('# ') for line in text.splitlines())
-        cfg = eval(expression, {'RewardCfg': RewardCfg})
-        self.assertAlmostEqual(cfg.sigma_link_pos/14, .3**2)
-        self.assertAlmostEqual(cfg.sigma_link_rotation/14, .4**2)
-        self.assertAlmostEqual(3*cfg.sigma_link_lin_vel, 1.)
-        self.assertAlmostEqual(3*cfg.sigma_link_ang_vel, 3.14**2)
-        self.assertEqual(cfg.w_dofs_vel, 0.)
-        self.assertEqual(cfg.w_action_rate, -.1)
+        self.assertIn('# REWARD_CFG = RewardCfg()', source.read_text())
+        reference = RewardCfg()
+        self.assertEqual(reference.sigma_base_pos, .1)
+        self.assertEqual(reference.w_action_rate, -.01)
+        self.assertEqual(reference.w_dofs_vel, .1)
 
 
 if __name__ == '__main__':

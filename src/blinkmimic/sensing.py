@@ -1,7 +1,7 @@
 """Policy observation as the robot's sensors and state estimator produce it.
 
 Observation layout (same as :meth:`blinkmimic.mdp.MDP.obs`): q - q0 - offset, qd, angular velocity,
-projected gravity, previous action, reference-relative root orientation (6D). The default
+projected gravity and previous action. The default
 :class:`SensingCfg` is the paper's: true state plus uniform noise (Table A.1). A robot can add its
 signal chain, as on a real robot's state estimator:
 
@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 import mujoco
 import torch
 
-from .rotations import mat_to_6d, quat_to_mat, skew, so3_exp
+from .rotations import quat_to_mat, skew, so3_exp
 
 if TYPE_CHECKING:
     from .dr import XiLayout
@@ -66,7 +66,6 @@ class SensingCfg:
     noise_joint_vel: float = 0.5
     noise_ang_vel: float = 0.2
     noise_gravity: float = 0.05
-    noise_ref_ori: float = 0.05
     """Uniform observation-noise half-widths (defaults: SuperMimic paper Table A.1)."""
     delay_hold_prob: float | None = None
     """None: no observation delay. Otherwise a 0/1 policy-step lag per sensor group, kept with this
@@ -87,7 +86,6 @@ def obs_noise(cfg: SensingCfg, J: int) -> torch.Tensor:
             torch.full((3,), cfg.noise_ang_vel),
             torch.full((3,), cfg.noise_gravity),
             torch.zeros(J),
-            torch.full((6,), cfg.noise_ref_ori),
         )
     )
 
@@ -119,8 +117,8 @@ class ObsPipeline:
         self.stateful = self.cfg.stateful
         J = robot.num_joints
         self.J, self.obs_dim, self.device = J, mdp.obs_dim, device
-        # delay group of every observation dim: q, qd, angular velocity, attitude (gravity + ref ori); -1 = exact
-        group = [0] * J + [1] * J + [2] * 3 + [3] * 3 + [-1] * J + [3] * 6
+        # delay group of every observation dim: q, qd, angular velocity, attitude (gravity); -1 = exact
+        group = [0] * J + [1] * J + [2] * 3 + [3] * 3 + [-1] * J
         self.group = torch.tensor([max(g, 0) for g in group], device=device)
         self.delayed = torch.tensor([g >= 0 for g in group], device=device)
         jf = self.cfg.joint_vel_filter
@@ -224,8 +222,7 @@ class ObsPipeline:
             ang_vel = (R.transpose(-1, -2) @ w.unsqueeze(-1)).squeeze(-1)
         qd_obs = st["qd_f"] if self.cfg.joint_vel_filter is not None else qd
         g_b = -R_att[..., 2, :]
-        rel = mat_to_6d(R_att.transpose(-1, -2) @ self.mdp.motion.root_R[f])
-        return torch.cat((q - self.mdp.default_q - dq0, qd_obs, ang_vel, g_b, a_prev, rel), -1)
+        return torch.cat((q - self.mdp.default_q - dq0, qd_obs, ang_vel, g_b, a_prev), -1)
 
     def observe(self, st: dict, raw: torch.Tensor, noise: bool, delay: bool) -> tuple[torch.Tensor, dict]:
         st = dict(st)

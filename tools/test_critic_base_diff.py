@@ -33,6 +33,7 @@ class CriticBaseDiffTest(unittest.TestCase):
         m = self.motion
         self.init = torch.cat((m.root_p[self.f0] + self.shift, mat_to_quat(self.Y @ m.root_R[self.f0])), -1)
         self.xi = torch.zeros(2, 2)
+        self.mdp.feet = [0]  # synthetic tracked root stands in for a contact body during the policy-update test
 
     def state(self, f):
         m = self.motion
