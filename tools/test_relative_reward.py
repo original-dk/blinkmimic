@@ -35,7 +35,7 @@ class RelativeRewardTest(unittest.TestCase):
         self.R = so3_exp(torch.randn(n, 3) * 0.5)
         self.v, self.w = torch.randn(n, 3), torch.randn(n, 3)
         self.q = torch.zeros(n, 1)
-        self.motion = SimpleNamespace(root_p=self.p, root_R=self.R, body_p=self.p[:, None],
+        self.motion = SimpleNamespace(root_p=self.p, root_R=self.R, root_v=self.v, root_w=self.w, body_p=self.p[:, None],
                                       body_R=self.R[:, None], body_v=self.v[:, None], body_w=self.w[:, None],
                                       frame_bin=torch.arange(n), ref_state=self.ref_state)
         self.mdp = MDP(RootKinematics(), self.motion, torch.zeros(1), 1)

@@ -147,7 +147,7 @@ from blinkmimic.buffer import ReplayBuffer
 from blinkmimic.dr import XiLayout
 from blinkmimic.env import PHYSICS_DT, TrackingSim, make_sim
 from blinkmimic.kinematics import Kinematics
-from blinkmimic.mdp import MDP, inv_dim, unflatten_state
+from blinkmimic.mdp import MAX_STEP_REWARD, MDP, inv_dim, unflatten_state
 from blinkmimic.motion import CONTROL_DT, MotionLib
 import blinkmimic.networks as networks
 import blinkmimic.rotations as rotations
@@ -543,7 +543,7 @@ def policy_update():
             v_loss.backward()
             nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
             opt_v.step()
-    return loss.detach(), v_loss.detach(), (r_sum / HZ / 0.1).mean(), gn.detach(), c.mean().detach()
+    return loss.detach(), v_loss.detach(), (r_sum / HZ / MAX_STEP_REWARD).mean(), gn.detach(), c.mean().detach()
 
 
 # ------------------------------------------------------------------------------------------------
@@ -586,7 +586,7 @@ def _collect_core():
     # the simulator wrapper rebinds these per step: copy them back into the static tensors the graph reads
     CG["f"].copy_(env.f), CG["ep_step"].copy_(env.ep_step), CG["a_prev"].copy_(env.a_prev)
     env.f, env.ep_step, env.a_prev = CG["f"], CG["ep_step"], CG["a_prev"]
-    core = {"done": out["done"], "term": out["term"], "f": out["f"], "r_mean": out["r"].mean() / 0.1}
+    core = {"done": out["done"], "term": out["term"], "f": out["f"], "r_mean": out["r"].mean() / MAX_STEP_REWARD}
     if args.reset_masked:  # the episode ends in the graph too (reset_masked writes f, ep_step, a_prev in place)
         out = env.step_tail_masked(out)
         n = out["n_done"]
@@ -674,7 +674,7 @@ def collect(n_steps: int, stats: dict):
         wm.out_norm.update(wm_out)
         wm.inc_norm.update(wm_inc)
         sim_steps += args.num_envs
-        stats["r"].append(out["r"].mean() / 0.1)
+        stats["r"].append(out["r"].mean() / MAX_STEP_REWARD)
         if "ep_len" in out:
             stats["ep_len"].append(out["ep_len"].mean())
             stats["ep_ret"].append(out["ep_ret_norm"].mean())

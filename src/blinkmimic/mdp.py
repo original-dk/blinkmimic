@@ -32,7 +32,7 @@ def obs_scale(J: int) -> torch.Tensor:
 
 
 CONTACT_Z = 0.045  # ankle-roll link origin height below which a foot counts as in contact (as in tools/eval_metrics.py)
-MAX_STEP_REWARD = (4 * 1.0 + 2 * 0.5) * CONTROL_DT
+MAX_STEP_REWARD = (4 * 1.0 + 4 * 0.5) * CONTROL_DT
 
 
 @dataclass
@@ -43,6 +43,8 @@ class RewardCfg:
     body_angvel_std: float = 3.14
     root_pos_std: float = 0.3
     root_ori_std: float = 0.4
+    root_linvel_std: float = 1.0
+    root_angvel_std: float = 3.14
     w_action_rate: float = -0.1
     w_joint_limit: float = -2.0
     soft_limit_factor: float = 0.9
@@ -114,6 +116,34 @@ class MDP:
         return o + (2 * torch.rand_like(o) - 1) * self.obs_noise
 
     # ---------------- reward / termination ----------------
+    def base_diff(self, S, f, init_root=None, init_f=None):
+        """Reference base diffs: initial-frame displacement/rotation, current-base local velocities.
+
+        ``init_root`` is robot xyz+wxyz after reset noise; ``init_f`` selects the expert frame before
+        noise. Without context, position/orientation compare absolute poses for standalone playback.
+        Rotation diff is 2 * sign(q_err.w) * q_err.xyz, not a rotation vector/geodesic angle.
+        Velocity diffs use each current base frame; initial velocities are not subtracted.
+        """
+        assert (init_root is None) == (init_f is None), "reset pose and expert frame must be supplied together"
+        p, R, v, w = S[:4]
+        m = self.motion
+        rp, rR = m.root_p[f], m.root_R[f]
+        if init_root is None:
+            diff_pos, rel_R, ref_rel_R = rp - p, R, rR
+        else:
+            p0, R0 = init_root[..., :3], quat_to_mat(init_root[..., 3:7])
+            rp0, rR0 = m.root_p[init_f], m.root_R[init_f]
+            R0t, rR0t = R0.transpose(-1, -2), rR0.transpose(-1, -2)
+            diff_pos = mv3(rR0t, rp - rp0) - mv3(R0t, p - p0)
+            rel_R, ref_rel_R = mm3(R0t, R), mm3(rR0t, rR)
+        q_err = mat_to_quat(mm3(rel_R.transpose(-1, -2), ref_rel_R))
+        sign = torch.where(q_err[..., :1] < 0, -1.0, 1.0)
+        diff_rot = 2 * sign * q_err[..., 1:]
+        Rt, rRt = R.transpose(-1, -2), rR.transpose(-1, -2)
+        diff_lv = mv3(rRt, m.root_v[f]) - mv3(Rt, v)
+        diff_av = mv3(rRt, m.root_w[f]) - mv3(Rt, w)
+        return diff_pos, diff_rot, diff_lv, diff_av
+
     def reward(self, S, f, a, a_prev, terms: bool = False, w_contact: float = 0.0,
                init_root=None, init_f=None):
         """Per-step reward (already multiplied by dt) comparing S with reference frame f.
@@ -141,16 +171,11 @@ class MDP:
         Rt, rRt = R.transpose(-1, -2).unsqueeze(-3), rR.transpose(-1, -2).unsqueeze(-3)
         e_lv = ((mv3(rRt, m.body_v[f]) - mv3(Rt, bv)) ** 2).sum(-1).mean(-1)
         e_av = ((mv3(rRt, m.body_w[f]) - mv3(Rt, bw)) ** 2).sum(-1).mean(-1)
-        assert (init_root is None) == (init_f is None), "reset pose and expert frame must be supplied together"
-        if init_root is None:
-            e_rp = ((rp - p) ** 2).sum(-1)
-            e_ro = rot_angle_sq(rR, R)
-        else:
-            p0, R0 = init_root[..., :3], quat_to_mat(init_root[..., 3:7])
-            rp0, rR0 = m.root_p[init_f], m.root_R[init_f]
-            R0t, rR0t = R0.transpose(-1, -2), rR0.transpose(-1, -2)
-            e_rp = ((mv3(rR0t, rp - rp0) - mv3(R0t, p - p0)) ** 2).sum(-1)
-            e_ro = rot_angle_sq(mm3(rR0t, rR), mm3(R0t, R))
+        diff_rp, diff_ro, diff_rlv, diff_rav = self.base_diff(S, f, init_root, init_f)
+        e_rp = (diff_rp ** 2).sum(-1)
+        e_ro = (diff_ro ** 2).sum(-1)
+        e_rlv = (diff_rlv ** 2).sum(-1)
+        e_rav = (diff_rav ** 2).sum(-1)
         r_track = (
             torch.exp(-e_pos / c.body_pos_std**2)
             + torch.exp(-e_ori / c.body_ori_std**2)
@@ -158,6 +183,8 @@ class MDP:
             + torch.exp(-e_av / c.body_angvel_std**2)
             + 0.5 * torch.exp(-e_rp / c.root_pos_std**2)
             + 0.5 * torch.exp(-e_ro / c.root_ori_std**2)
+            + 0.5 * torch.exp(-e_rlv / c.root_linvel_std**2)
+            + 0.5 * torch.exp(-e_rav / c.root_angvel_std**2)
         )
         r_rate = ((a - a_prev) ** 2).sum(-1)
         r_lim = (torch.relu(q - self.soft_hi) + torch.relu(self.soft_lo - q)).sum(-1)
@@ -177,6 +204,8 @@ class MDP:
                 "e_body_ori": e_ori,
                 "e_root_pos": e_rp,
                 "e_root_ori": e_ro,
+                "e_root_linvel": e_rlv,
+                "e_root_angvel": e_rav,
                 "e_body_linvel": e_lv,
                 "e_body_angvel": e_av,
                 "action_rate": r_rate,
