@@ -166,6 +166,8 @@ def main():
             data.qpos[3:7] = d["root_quat"][tt, c]
             data.qpos[7:nq] = d["q"][tt, c]
             ref_p, ref_R = ghost_pose(d, f, c)
+            # Measure before optional anchoring, which hides xy drift in the display.
+            root_error = np.linalg.norm(d["root_p"][tt, c] - ref_p)
             data.qpos[nq : nq + 3] = ref_p
             if a.anchor_ghost:  # optional display anchor; retain the recorded yaw
                 data.qpos[nq : nq + 2] = d["root_p"][tt, c][:2]
@@ -188,7 +190,7 @@ def main():
             draw = ImageDraw.Draw(img)
             # the clock keeps running after a termination (the robot is frozen at its last state), so videos of
             # several policies stay in sync
-            label = f"{a.title}  episode {c}  {clip}  t={t * 0.02:5.1f}s"
+            label = f"{a.title}  episode {c}  {clip}  t={t * 0.02:5.1f}s  base error={root_error:.3f}m"
             if fell_at is not None:
                 label += f"  [terminated at {fell_at * 0.02:.1f}s]"
             for xy, txt in (((16, 12), label), ((16, a.height - 38), f"solid: simulated {robot.name} policy (mjlab + MuJoCo-Warp)   blue ghost: reference")):

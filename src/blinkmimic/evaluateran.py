@@ -155,6 +155,10 @@ def main():
         reset_random_yaw(env, start_frames, yaw)
         clip_end = motion.clip_end[clip_of]
         ret = torch.zeros(N, device=dev)
+        root_sq_sum = torch.zeros(N, device=dev)
+        root_sq_max = torch.zeros(N, device=dev)
+        root_sq_final = torch.zeros(N, device=dev)
+        steps = torch.zeros(N, device=dev)
         hist = None
         traj = {"root_p": [], "root_quat": [], "q": [], "f": [], "alive": []}
         while not bool(env.done_eval.all()):
@@ -170,6 +174,13 @@ def main():
                 traj["q"].append(S[4].cpu()), traj["f"].append(env.f.cpu()), traj["alive"].append(alive.cpu())
             out = env.step(a)
             ret += torch.where(alive, out["r"], 0.0)
+            # The reward error is in the two initial root frames. Its norm equals the distance
+            # to the fixed, yaw-rotated ghost, including when the initial expert pose is tilted.
+            e_root = out["terms"]["e_root_pos"]
+            root_sq_sum += torch.where(alive, e_root, 0.0)
+            root_sq_max = torch.maximum(root_sq_max, torch.where(alive, e_root, 0.0))
+            root_sq_final = torch.where(alive, e_root, root_sq_final)
+            steps += alive.float()
             env.f = torch.minimum(env.f, clip_end - 1)  # finished clips keep stepping; keep f+1 in range
         remaining = clip_end - start_frames
         norm = ret / (remaining.float() * MAX_STEP_REWARD)
@@ -186,6 +197,10 @@ def main():
             "yaw_degrees": args.yaw_degrees,
             "seed": args.seed,
             "n_rollouts": N,
+            "root_pos_rmse_m": (root_sq_sum.sum() / steps.sum().clamp(min=1)).sqrt().item(),
+            "root_pos_max_m": root_sq_max.max().sqrt().item(),
+            "per_rollout_root_pos_rmse_m": (root_sq_sum / steps.clamp(min=1)).sqrt().tolist(),
+            "per_rollout_root_pos_final_m": root_sq_final.sqrt().tolist(),
             "per_clip": {motion.names[i]: round(norm_c[i].item(), 4) for i in sampled},
             "per_clip_count": {motion.names[i]: int(counts[i].item()) for i in sampled},
             "per_clip_fail_rate": {motion.names[i]: round(fail_c[i].item(), 3) for i in sampled},

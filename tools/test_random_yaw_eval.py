@@ -150,7 +150,8 @@ class RandomYawEvaluationTest(unittest.TestCase):
             def step(self, a):
                 self.f = self.f + 1
                 self.done_eval |= self.f >= self.motion.clip_end[self.motion.clip_id[self.init_f]]
-                return dict(r=torch.full((self.N,), MAX_STEP_REWARD))
+                return dict(r=torch.full((self.N,), MAX_STEP_REWARD),
+                            terms=dict(e_root_pos=torch.full((self.N,), 0.04)))
 
         class Actor:
             def __init__(self, *args, **kwargs):
@@ -204,12 +205,55 @@ class RandomYawEvaluationTest(unittest.TestCase):
             self.assertAlmostEqual(result['norm_return'], 1, places=6)
             self.assertAlmostEqual(result['norm_return_framew'], 1, places=6)
             self.assertEqual(sum(result['per_clip_count'].values()), 12)
+            self.assertAlmostEqual(result['root_pos_rmse_m'], .2, places=6)
+            self.assertAlmostEqual(result['root_pos_max_m'], .2, places=6)
+            np.testing.assert_allclose(result['per_rollout_root_pos_final_m'], .2, atol=1e-6)
             self.assertTrue(commands)
             d = dict(np.load(record))
             np.testing.assert_array_equal(d['ref_root_p'], source.root_p.numpy())
             np.testing.assert_array_equal(d['f'][0], d['start_frame'])
             np.testing.assert_array_equal(source.clip_id[d['start_frame']].numpy(), d['rollout_clip'])
             self.assertEqual(d['root_p'].shape[1], 12)
+
+    def test_long_trajectory_ghost_distance_equals_reward_base_error(self):
+        import importlib.util
+        from pathlib import Path
+        import numpy as np
+        spec = importlib.util.spec_from_file_location('render_ran', Path(__file__).with_name('render_ran.py'))
+        renderer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(renderer)
+        # Arbitrary nonzero reset frame, tilted initial base and a curved 20 m trajectory.
+        m = self.source
+        t = torch.linspace(0, 1, 1001)
+        m.root_p = torch.stack((20*t, 4*torch.sin(3*t), 1+.1*t), -1)
+        m.root_R = so3_exp(torch.stack((.2+.1*t, -.3+.05*t, 2*t), -1))
+        m.root_v = torch.stack((torch.full_like(t, 20.), 12*torch.cos(3*t), torch.full_like(t, .1)), -1)
+        m.root_w = torch.zeros_like(m.root_v)
+        m.q, m.qd = torch.zeros(len(t), 1), torch.zeros(len(t), 1)
+        m.body_p, m.body_R = m.root_p[:, None], m.root_R[:, None]
+        m.body_v, m.body_w = m.root_v[:, None], m.root_w[:, None]
+        f0 = 137
+        f = torch.arange(f0, len(t))
+        mdp = MDP(RootKinematics(), m, torch.zeros(1), 1)
+        for yaw in (-1.57, -.73, 0., .82, 1.57):
+            Y = so3_exp(torch.tensor([0., 0., yaw]))
+            p0 = m.root_p[f0]
+            ideal_p = p0 + mv3(Y, m.root_p[f] - p0)
+            R = Y @ m.root_R[f]
+            init = torch.cat((p0, mat_to_quat(Y @ m.root_R[f0])), -1).expand(len(f), -1)
+            d = dict(ref_root_p=m.root_p.numpy(), ref_root_R=m.root_R.numpy(),
+                     start_frame=np.array([f0]), yaw=np.array([yaw]))
+            ghost = torch.tensor(np.stack([renderer.ghost_pose(d, int(i), 0)[0] for i in f]), dtype=torch.float32)
+            torch.testing.assert_close(ideal_p, ghost, atol=4e-6, rtol=1e-6)
+            for offset in (torch.zeros(3), torch.tensor([.7, -.4, .2])):
+                S = (ideal_p+offset, R, mv3(Y, m.root_v[f]), mv3(Y, m.root_w[f]), m.q[f], m.qd[f])
+                a = torch.zeros(len(f), 1)
+                _, terms = mdp.reward(S, f, a, a, terms=True, init_root=init,
+                                      init_f=torch.full_like(f, f0))
+                world_error = ((S[0] - ghost)**2).sum(-1)
+                torch.testing.assert_close(terms['e_root_pos'], world_error, atol=6e-6, rtol=2e-5)
+                if not offset.any():
+                    self.assertLess(terms['e_root_pos'].max().item(), 1e-9)
 
     def test_renderer_selects_all_episodes_including_repeated_motions(self):
         import importlib.util
