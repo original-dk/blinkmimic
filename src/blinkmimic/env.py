@@ -18,7 +18,7 @@ from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
 from mjlab.terrains import TerrainEntityCfg
 
 from .dr import DomainRandomizer, XiLayout
-from .mdp import MAX_STEP_REWARD, MDP, flatten_state
+from .mdp import MDP, flatten_state
 from .motion import CONTROL_DT, MotionLib
 from .robot import RobotSpec
 from .rotations import mat_to_quat, mv3, quat_to_mat, so3_exp
@@ -173,7 +173,6 @@ class TrackingSim:
         self.start_bin = torch.zeros(self.N, dtype=torch.long, device=dev)
         self.ep_disc_ret = torch.zeros(self.N, device=dev)
         self.ep_ret = torch.zeros(self.N, device=dev)
-        self.G_max = MAX_STEP_REWARD / (1 - gamma)
         self.bin_G = torch.full((motion.num_bins,), 0.0, device=dev)
         self.bin_w_avg = torch.full((motion.num_bins,), 1.0 / motion.num_bins, device=dev)
         # InstantTrack: share of resets sent one bin before recent failure points (per-bin termination rate)
@@ -195,6 +194,10 @@ class TrackingSim:
     @property
     def num_envs(self) -> int:
         return self.N
+
+    @property
+    def G_max(self) -> float:
+        return self.mdp.max_step_reward / (1 - self.gamma)
 
     # ------------------------------------------------------------------ state
     def state(self):
@@ -368,7 +371,7 @@ class TrackingSim:
             self.bin_fail.copy_(_bin_ema_w(bf, fb, term.float(), dw, 0.9))
         out["n_done"] = dw.sum()
         out["ep_len_sum"] = (T * dw).sum()
-        out["ep_ret_norm_sum"] = (self.ep_ret / (T * MAX_STEP_REWARD) * dw).sum()
+        out["ep_ret_norm_sum"] = (self.ep_ret / (T * self.mdp.max_step_reward) * dw).sum()
         self.reset_masked(done)
         return out
 
@@ -497,6 +500,6 @@ class TrackingSim:
                 else:
                     self.bin_fail.index_put_((fb,), 0.9 * self.bin_fail[fb] + 0.1 * term[ids].float())
             out["ep_len"] = T
-            out["ep_ret_norm"] = self.ep_ret[ids] / (T * MAX_STEP_REWARD)
+            out["ep_ret_norm"] = self.ep_ret[ids] / (T * self.mdp.max_step_reward)
             self.reset(ids)
         return out

@@ -122,12 +122,13 @@ source .venv/bin/activate
 ### 1. Train with relative reset rewards and random robot yaw/position
 
 ```bash
-PYTHON=python bash scripts/train.sh logs/run_s0 \
-  --seed 0 --iterations 3500 --ckpt_every 100 --yaw_degrees 90 --xy_range 0 0.1
+PYTHON=python bash scripts/train.sh logs/run_ref_s0 \
+  --seed 0 --iterations 3500 --ckpt_every 100 --yaw_degrees 90 --xy_range 0 0.1 \
+  --reward_preset reference
 ```
 
-This uses `PRESET[main]`, writes logs to `logs/run_s0`, and saves policy checkpoints such as
-`logs/run_s0/ckpt_003500.pt`. On a shared GPU, append `--eprobe_async 0` as noted below.
+This uses `PRESET[main]` with the reference reward preset, writes logs to `logs/run_ref_s0`, and saves policy checkpoints such as
+`logs/run_ref_s0/ckpt_003500.pt`. On a shared GPU, append `--eprobe_async 0` as noted below.
 
 Training samples a motion time bin using return/failure statistics, then a frame inside that bin. Each reset
 adds an independent, continuous uniform robot yaw offset in **[-90°, +90°]**, on top of the original reset noise.
@@ -161,20 +162,64 @@ those frames without subtracting base velocity. Rotation is a shortest-path 3D r
 `inverse(robot_local_quat) * reference_local_quat`, in radians.
 
 Each body reward is `exp(-mean_links(sum_xyz(diff**2)) / std**2)`. This averages squared vector norms over
-links, so the denominator does not scale with link count. Defaults remain `body_pos_std=0.3` meters,
+links, so the denominator does not scale with link count. With `--reward_preset default`, scales remain `body_pos_std=0.3` meters,
 `body_ori_std=0.4` radians, `body_linvel_std=1.0` m/s and `body_angvel_std=3.14` rad/s; an error equal to its std
 on every link gives reward `exp(-1)`. These are std parameters, equivalent to `sigma=std**2` in a direct
 sigma denominator. The critic now receives all four flattened body diffs instead of the old body position
 error only; its input dimension changes again, so use a new training run. At a vertical forward axis, where
 yaw is undefined, hybrid construction uses a zero heading rather than a degenerate rotation.
 
+### Reward presets and reference sigma conversion
+
+`--reward_preset reference` selects the supplied reference reward weights and sigma values; omit the flag or
+use `--reward_preset default` for the preceding branch configuration. The reference preset uses the same
+base/body diffs and actor inputs. It converts the reference sum/mean aggregations into our mean-link vector
+norms, using the actual tracked link count `N`:
+
+- Base errors: `std**2 = sigma`.
+- Link position/rotvec errors: `std**2 = sigma / N` (reference sums all links/components).
+- Link velocity errors: `std**2 = 3 * sigma` (reference averages all links/components).
+- Joint velocity: squared joint errors are summed, with `std**2 = 5`.
+
+For G1's 14 tracked links, the resolved values are:
+
+| Term | Reference weight | Converted std |
+|---|---:|---:|
+| base position | 0.5 | 0.316228 m |
+| base quaternion rotation diff | 0.5 | 0.316228 |
+| base linear velocity | 0.2 | 1.414214 m/s |
+| base angular velocity | 0.2 | 1.414214 rad/s |
+| link position | 0.5 | 0.188982 m |
+| link rotation vector | 0.6 | 0.267261 rad |
+| link linear velocity | 0.2 | 1.732051 m/s |
+| link angular velocity | 0.2 | 2.449490 rad/s |
+| joint velocity | 0.1 | 2.236068 rad/s |
+
+The base rotation diff is `2*sign(w)*q_err.xyz`; its std is not a rotation-vector angle.
+Action-rate and action-magnitude penalties are each `-0.01 * sum(action_error**2)`, with action error equal
+to `a-a_prev` and `a`, respectively. The reference preset disables the existing joint-limit penalty and the
+training-only contact bonus (including `PRESET[main]`'s `--contact_reward 0.25`), matching the supplied reward
+list. Joint-position and second-order action-rate rewards remain off. Reset sampling, sensing, termination
+and optimizer settings are unchanged by selecting a reward preset.
+
+The positive reward maximum is 3.0 before multiplying by control dt (default preset: 6.0). Simulator returns,
+reset-bin sampling, training logs and evaluation normalization all use the selected maximum. Normalized
+returns across different presets describe different objectives; compare physical error metrics on the same
+sampled starts as well.
+
+The preset name and full resolved configuration are saved in `args.json` and checkpoint args. Evaluators
+load that configuration automatically; no reward flag is needed at evaluation. Old checkpoints without
+reward metadata use the default preset. Resume requires a matching reward configuration, and changing the
+preset should start a new run. Batch evaluation requires one reward configuration per group; metric comparison
+groups checkpoints by their reward configuration. ONNX export also carries the resolved config for playback scoring.
+
 ### 2. Evaluate and record multiple random episodes
 
 ```bash
 python -m blinkmimic.evaluateran \
-  --run_dir logs/run_s0 \
-  --ckpt logs/run_s0/ckpt_003500.pt \
-  --record logs/run_s0/traj_ran.npz \
+  --run_dir logs/run_ref_s0 \
+  --ckpt logs/run_ref_s0/ckpt_003500.pt \
+  --record logs/run_ref_s0/traj_ran.npz \
   --episodes 20 --yaw_degrees 90 --xy_range 0 0.1 --seed 0
 ```
 
@@ -209,7 +254,7 @@ fixed to isolate translation. Position sampling has a separate reproducible RNG 
 
 ```bash
 MUJOCO_GL=egl python tools/render_ran.py \
-  logs/run_s0/traj_ran.npz logs/run_s0/result_ran.mp4 \
+  logs/run_ref_s0/traj_ran.npz logs/run_ref_s0/result_ran.mp4 \
   --robot g1 --seconds 10
 ```
 
@@ -226,17 +271,17 @@ reports the root distance in meters; `--clean` and `--white` omit the numerical 
 ```bash
 # Render selected episodes (zero-based indices) in this order.
 MUJOCO_GL=egl python tools/render_ran.py \
-  logs/run_s0/traj_ran.npz logs/run_s0/selected.mp4 \
+  logs/run_ref_s0/traj_ran.npz logs/run_ref_s0/selected.mp4 \
   --robot g1 --seconds 10 --rollouts 0 2 5
 
 # Render one episode.
 MUJOCO_GL=egl python tools/render_ran.py \
-  logs/run_s0/traj_ran.npz logs/run_s0/episode0.mp4 \
+  logs/run_ref_s0/traj_ran.npz logs/run_ref_s0/episode0.mp4 \
   --robot g1 --seconds 10 --rollout 0
 
 # Overlay body motion by following the robot's current XY, like the original renderer.
 MUJOCO_GL=egl python tools/render_ran.py \
-  logs/run_s0/traj_ran.npz logs/run_s0/anchored.mp4 \
+  logs/run_ref_s0/traj_ran.npz logs/run_ref_s0/anchored.mp4 \
   --robot g1 --seconds 10 --anchor_ghost
 ```
 
@@ -252,11 +297,11 @@ yaw or additional XY offset, while using this branch's current MDP/rewards:
 
 ```bash
 python -m blinkmimic.evaluate \
-  --run_dir logs/run_s0 --ckpt logs/run_s0/ckpt_003500.pt \
-  --record logs/run_s0/traj.npz
+  --run_dir logs/run_ref_s0 --ckpt logs/run_ref_s0/ckpt_003500.pt \
+  --record logs/run_ref_s0/traj.npz
 
 MUJOCO_GL=egl python tools/render.py \
-  logs/run_s0/traj.npz logs/run_s0/result.mp4 \
+  logs/run_ref_s0/traj.npz logs/run_ref_s0/result.mp4 \
   --robot g1 --seconds 10
 ```
 

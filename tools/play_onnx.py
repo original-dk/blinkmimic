@@ -11,6 +11,7 @@ Usage: python tools/play_onnx.py logs/<run>/dance1_subject2.onnx --robot g1 \
 """
 
 import argparse
+import json
 
 import numpy as np
 import onnxruntime as ort
@@ -19,7 +20,7 @@ import torch
 from blinkmimic.dr import XiLayout
 from blinkmimic.env import TrackingSim, make_sim
 from blinkmimic.kinematics import Kinematics
-from blinkmimic.mdp import MAX_STEP_REWARD, MDP
+from blinkmimic.mdp import MDP, RewardCfg
 from blinkmimic.motion import MotionLib
 from blinkmimic.robot import get_robot
 
@@ -51,6 +52,8 @@ def main():
     kin = Kinematics(robot, dev)
     motion = MotionLib([a.motion], kin, dev, robot.load_motion)
     mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)
+    mdp.set_reward_cfg(RewardCfg.from_args({"reward_cfg": json.loads(meta["reward_cfg"])}
+                                          if "reward_cfg" in meta else {}, len(kin.tracked_idx)))
     env = TrackingSim(make_sim(robot), 1, robot, motion, mdp, dev, eval_mode=True)
     env.done_eval[:] = False
     env.failed_eval[:] = False
@@ -78,7 +81,7 @@ def main():
         ret += r if alive else 0.0
         env.f = torch.minimum(env.f, motion.clip_end - 1)
         a_prev, ref_quat = act, out["next_anchor_quat_w"][0]
-    norm = ret / ((motion.clip_len[0].item() - 1) * MAX_STEP_REWARD)
+    norm = ret / ((motion.clip_len[0].item() - 1) * mdp.max_step_reward)
     print(f"{meta['motion']}: norm return {norm:.4f}, failed {bool(env.failed_eval.item())}"
           + ("" if robot.sensing.stateful else f", max |obs - simulator obs| {obs_err:.2e}"))  # fmt: skip
 

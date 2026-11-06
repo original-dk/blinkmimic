@@ -10,7 +10,7 @@ import torch
 
 from blinkmimic.evaluateran import reset_random_yaw, sample_starts
 from blinkmimic.env import sample_reset_xy
-from blinkmimic.mdp import MDP
+from blinkmimic.mdp import MDP, RewardCfg
 from blinkmimic.motion import MotionLib
 from blinkmimic.rotations import mat_to_quat, mv3, so3_exp
 import test_relative_reward as relative
@@ -168,6 +168,12 @@ class RandomYawEvaluationTest(unittest.TestCase):
         torch.testing.assert_close(remaining, torch.ones(2, dtype=torch.long))
 
     def test_evaluator_loop_records_original_commands_and_remaining_returns(self):
+        self.check_evaluator_loop('default')
+
+    def test_evaluator_loads_reference_preset_and_normalizes_by_its_maximum(self):
+        self.check_evaluator_loop('reference')
+
+    def check_evaluator_loop(self, preset):
         from contextlib import ExitStack, redirect_stdout
         import io
         import json
@@ -208,7 +214,7 @@ class RandomYawEvaluationTest(unittest.TestCase):
             def step(self, a):
                 self.f = self.f + 1
                 self.done_eval |= self.f >= self.motion.clip_end[self.motion.clip_id[self.init_f]]
-                return dict(r=torch.full((self.N,), MAX_STEP_REWARD),
+                return dict(r=torch.full((self.N,), self.mdp.max_step_reward),
                             terms=dict(e_root_pos=torch.full((self.N,), 0.04)))
 
         class Actor:
@@ -246,7 +252,7 @@ class RandomYawEvaluationTest(unittest.TestCase):
             stack.enter_context(patch('blinkmimic.env.TrackingSim', Env))
             stack.enter_context(patch('blinkmimic.networks.Policy', Actor))
             stack.enter_context(patch('blinkmimic.networks.policy_kwargs', return_value={}))
-            stack.enter_context(patch('torch.load', return_value=dict(args=dict(goal_frames=2, hist=1), pi={})))
+            stack.enter_context(patch('torch.load', return_value=dict(args=dict(goal_frames=2, hist=1, reward_preset=preset), pi={})))
             # Run the real CLI/evaluation/recording logic with CPU simulation and policy doubles.
             for name in ('tensor', 'zeros', 'ones', 'arange'):
                 original = getattr(torch, name)
@@ -260,6 +266,7 @@ class RandomYawEvaluationTest(unittest.TestCase):
                 main()
             self.assertEqual(ended.exception.code, 0)
             result = json.loads(output.getvalue())
+            self.assertEqual(instances[-1].mdp.cfg, RewardCfg.from_preset(preset, 1))
             self.assertAlmostEqual(result['norm_return'], 1, places=6)
             self.assertAlmostEqual(result['norm_return_framew'], 1, places=6)
             self.assertEqual(sum(result['per_clip_count'].values()), 12)

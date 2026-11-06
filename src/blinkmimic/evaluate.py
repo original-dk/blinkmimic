@@ -45,7 +45,7 @@ import blinkmimic.networks as networks
 from blinkmimic.dr import XiLayout
 from blinkmimic.env import TrackingSim, make_sim
 from blinkmimic.kinematics import Kinematics
-from blinkmimic.mdp import MAX_STEP_REWARD, MDP
+from blinkmimic.mdp import MDP, RewardCfg
 from blinkmimic.motion import MotionLib
 from blinkmimic.networks import Policy, policy_kwargs
 from blinkmimic.robot import RobotSpec, get_robot
@@ -92,6 +92,7 @@ clip_of = torch.arange(N, device=dev) % C
 @torch.no_grad()
 def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
     a_ = ck["args"]
+    mdp.set_reward_cfg(RewardCfg.from_args(a_, len(kin.tracked_idx)))
     K, Hh = a_["goal_frames"], a_["hist"]
     networks.AMP_DTYPE = torch.bfloat16 if a_.get("amp", "none") == "bf16" else None
     widths = lambda key, default: tuple(int(x) for x in a_.get(key, default).split(","))  # noqa: E731
@@ -124,12 +125,12 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
         steps += alive.float()
         env.f = torch.minimum(env.f, clip_end - 1)  # finished clips keep stepping; keep f+1 in range
     clip_len = motion.clip_len[clip_of]
-    norm = ret / ((clip_len - 1).float() * MAX_STEP_REWARD)
+    norm = ret / ((clip_len - 1).float() * mdp.max_step_reward)
     norm_c = norm.view(args.repeats, C).mean(0)
     fail_c = env.failed_eval.view(args.repeats, C).float().mean(0)
     res = {
         "norm_return": norm.mean().item(),
-        "norm_return_framew": (ret.sum() / ((clip_len - 1).sum() * MAX_STEP_REWARD)).item(),
+        "norm_return_framew": (ret.sum() / ((clip_len - 1).sum() * mdp.max_step_reward)).item(),
         "n_failed": int(env.failed_eval.sum().item()),
         "fail_rate": env.failed_eval.float().mean().item(),
         "failed": [motion.names[i] for i in (fail_c > 0).nonzero().flatten().tolist()],

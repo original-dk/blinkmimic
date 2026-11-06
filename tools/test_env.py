@@ -14,7 +14,7 @@ import torch
 from blinkmimic.dr import XiLayout
 from blinkmimic.env import TrackingSim, make_sim
 from blinkmimic.kinematics import Kinematics
-from blinkmimic.mdp import MAX_STEP_REWARD, MDP
+from blinkmimic.mdp import MDP
 from blinkmimic.motion import MotionLib
 from blinkmimic.robot import get_robot
 from blinkmimic.rotations import quat_to_mat, rot_angle_sq
@@ -52,6 +52,6 @@ for t in range(150):
     f1 = env.f + 1
     a = (motion.q[f1] - env.default_q) / env.alpha
     out = env.step(a)
-    rs.append(out["r"].mean().item() / MAX_STEP_REWARD)
+    rs.append(out["r"].mean().item() / mdp.max_step_reward)
     if t % 25 == 0:
         print(t, "norm reward", rs[-1], "term frac", env.failed_eval.float().mean().item(), "e_body_pos", out["terms"]["e_body_pos"].mean().item())

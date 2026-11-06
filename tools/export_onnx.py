@@ -19,6 +19,8 @@ Usage: python tools/export_onnx.py --robot g1 --ckpt logs/<run>/ckpt_003500.pt \
 """
 
 import argparse
+import dataclasses
+import json
 import os
 import re
 
@@ -28,7 +30,7 @@ from torch import nn
 
 import blinkmimic.networks as networks
 from blinkmimic.kinematics import Kinematics
-from blinkmimic.mdp import obs_dim
+from blinkmimic.mdp import RewardCfg, obs_dim
 from blinkmimic.motion import CONTROL_DT, MotionLib
 from blinkmimic.networks import Policy, policy_kwargs
 from blinkmimic.robot import RobotSpec, get_robot
@@ -96,6 +98,7 @@ def main():
     fmt = lambda xs: ",".join(f"{float(x):.6g}" for x in xs)  # noqa: E731
     meta = {
         "run_path": os.path.abspath(a.ckpt),
+        "reward_cfg": json.dumps(dataclasses.asdict(RewardCfg.from_args(ck["args"], len(robot.tracked_bodies)))),
         "motion": os.path.splitext(os.path.basename(a.motion))[0],
         "motion_num_frames": str(motion.num_frames),
         "joint_names": ",".join(robot.joint_names),

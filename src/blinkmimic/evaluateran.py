@@ -103,7 +103,7 @@ def main():
     from blinkmimic.dr import XiLayout
     from blinkmimic.env import TrackingSim, make_sim
     from blinkmimic.kinematics import Kinematics
-    from blinkmimic.mdp import MAX_STEP_REWARD, MDP
+    from blinkmimic.mdp import MDP, RewardCfg
     from blinkmimic.motion import MotionLib
     from blinkmimic.networks import Policy, policy_kwargs
     from blinkmimic.robot import RobotSpec, get_robot
@@ -152,6 +152,7 @@ def main():
     @torch.no_grad()
     def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
         a_ = ck["args"]
+        mdp.set_reward_cfg(RewardCfg.from_args(a_, len(kin.tracked_idx)))
         K, Hh = a_["goal_frames"], a_["hist"]
         networks.AMP_DTYPE = torch.bfloat16 if a_.get("amp", "none") == "bf16" else None
         widths = lambda key, default: tuple(int(x) for x in a_.get(key, default).split(","))  # noqa: E731
@@ -192,14 +193,14 @@ def main():
             steps += alive.float()
             env.f = torch.minimum(env.f, clip_end - 1)  # finished clips keep stepping; keep f+1 in range
         remaining = clip_end - start_frames
-        norm = ret / (remaining.float() * MAX_STEP_REWARD)
+        norm = ret / (remaining.float() * mdp.max_step_reward)
         counts = torch.zeros(C, device=dev).index_add_(0, clip_of, torch.ones(N, device=dev))
         norm_c = torch.zeros(C, device=dev).index_add_(0, clip_of, norm) / counts.clamp(min=1)
         fail_c = torch.zeros(C, device=dev).index_add_(0, clip_of, env.failed_eval.float()) / counts.clamp(min=1)
         sampled = (counts > 0).nonzero().flatten().tolist()
         res = {
             "norm_return": norm.mean().item(),
-            "norm_return_framew": (ret.sum() / (remaining.sum() * MAX_STEP_REWARD)).item(),
+            "norm_return_framew": (ret.sum() / (remaining.sum() * mdp.max_step_reward)).item(),
             "n_failed": int(env.failed_eval.sum().item()),
             "fail_rate": env.failed_eval.float().mean().item(),
             "failed": [motion.names[i] for i in sampled if fail_c[i] > 0],
