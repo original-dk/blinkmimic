@@ -48,8 +48,6 @@ parser.add_argument("--compile_more", action="store_true",
 parser.add_argument("--pi_ema", type=float, default=0.0,
                     help="Polyak average of the policy weights (decay per update); checkpoints store the average as 'pi'")  # fmt: skip
 parser.add_argument("--warmup_steps", type=int, default=64, help="sim steps before any update")
-parser.add_argument("--contact_reward", type=float, default=0.0,
-                    help="weight of the contact-matching / anti-slip reward term in imagination (evaluation reward unchanged)")
 # ---- method changes of this release (defaults = SuperMimic baseline; scripts/train.sh sets the released recipe) ----
 parser.add_argument("--wm_structured", action="store_true",
                     help="semi-implicit world model: velocity increments + position corrections on top of the trapezoidal drift")
@@ -278,7 +276,7 @@ def _wm_rollout(s, a, a_prev, xi):
 
 FEET = [robot.tracked_bodies.index(b) for b in ("left_ankle_roll_link", "right_ankle_roll_link")] if robot.name == "g1" else []
 mdp.feet = FEET
-assert args.contact_reward == 0 or FEET, "--contact_reward needs foot bodies (g1)"
+assert mdp.cfg.w_contact == 0 or FEET, "reward_cfg.w_contact needs foot bodies (g1)"
 if args.ref_contact_fix:
     motion.set_ref_contact(FEET)
 
@@ -313,7 +311,7 @@ def _imag_step_sensed(S, o_hist, a_prev, f, xi, xi_n, g, st):
 
 
 def _reward_term(S, f, a, a_prev, init_root, init_f):
-    return mdp.reward(S, f, a, a_prev, w_contact=args.contact_reward,
+    return mdp.reward(S, f, a, a_prev, w_contact=mdp.cfg.w_contact,
                       init_root=init_root, init_f=init_f), mdp.soft_termination(S, f)
 
 

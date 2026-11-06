@@ -93,14 +93,20 @@ class BaseReferenceTest(unittest.TestCase):
         r, e = self.mdp.reward(S, x.f, x.a, x.a, terms=True, init_root=x.context(), init_f=x.f0)
         c = self.mdp.cfg
         # Reconstruct the complete tracking sum to catch missing base-speed terms or wrong weights.
-        expected = sum(torch.exp(-e[key] / std**2) for key, std in
-                       (('e_body_pos', c.body_pos_std), ('e_body_ori', c.body_ori_std),
-                        ('e_body_linvel', c.body_linvel_std), ('e_body_angvel', c.body_angvel_std)))
-        expected += .5 * sum(torch.exp(-e[key] / std**2) for key, std in
-                             (('e_root_pos', c.root_pos_std), ('e_root_ori', c.root_ori_std),
-                              ('e_root_linvel', c.root_linvel_std), ('e_root_angvel', c.root_angvel_std)))
+        n = len(self.mdp.kin.tracked_idx)
+        expected = (
+            c.w_link_pos * torch.exp(-e['e_body_pos'] * n / c.sigma_link_pos)
+            + c.w_link_rotation * torch.exp(-e['e_body_ori'] * n / c.sigma_link_rotation)
+            + c.w_link_lin_vel * torch.exp(-e['e_body_linvel'] / (3*c.sigma_link_lin_vel))
+            + c.w_link_ang_vel * torch.exp(-e['e_body_angvel'] / (3*c.sigma_link_ang_vel))
+            + c.w_base_pos * torch.exp(-e['e_root_pos'] / c.sigma_base_pos)
+            + c.w_base_rotation * torch.exp(-e['e_root_ori'] / c.sigma_base_rotation)
+            + c.w_base_lin_vel * torch.exp(-e['e_root_linvel'] / c.sigma_base_lin_vel)
+            + c.w_base_ang_vel * torch.exp(-e['e_root_angvel'] / c.sigma_base_ang_vel)
+            + c.w_dofs_vel * torch.exp(-e['e_joint_vel'] / c.sigma_dofs_vel)
+        )
         torch.testing.assert_close(r, expected * CONTROL_DT)
-        self.assertAlmostEqual(MAX_STEP_REWARD, 6 * CONTROL_DT)
+        self.assertAlmostEqual(MAX_STEP_REWARD, 3 * CONTROL_DT)
 
     def test_local_velocity_gradients_eager_and_compiled(self):
         x = self.fixture

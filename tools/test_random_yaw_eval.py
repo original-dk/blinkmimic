@@ -246,7 +246,7 @@ class RandomYawEvaluationTest(unittest.TestCase):
             stack.enter_context(patch('blinkmimic.env.TrackingSim', Env))
             stack.enter_context(patch('blinkmimic.networks.Policy', Actor))
             stack.enter_context(patch('blinkmimic.networks.policy_kwargs', return_value={}))
-            stack.enter_context(patch('torch.load', return_value=dict(args=dict(goal_frames=2, hist=1), pi={})))
+            stack.enter_context(patch('torch.load', return_value=dict(args=dict(goal_frames=2, hist=1, reward_cfg={'unused_old_snapshot': True}), pi={})))
             # Run the real CLI/evaluation/recording logic with CPU simulation and policy doubles.
             for name in ('tensor', 'zeros', 'ones', 'arange'):
                 original = getattr(torch, name)

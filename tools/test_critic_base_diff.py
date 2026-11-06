@@ -111,7 +111,7 @@ class CriticBaseDiffTest(unittest.TestCase):
         s = dict(s=flatten_state(self.state(self.f)), f=self.f, xi=self.xi, a_prev=torch.zeros(B, 1),
                  init_root=self.init, init_f=self.f0)
         h = {k: s[k][:, None].expand(B, Hh, *s[k].shape[1:]) for k in ('s', 'f', 'xi', 'a_prev')}
-        args = SimpleNamespace(pi_batch=B, contact_reward=0., gamma=.99, lam=.95, compile_more=True,
+        args = SimpleNamespace(pi_batch=B, gamma=.99, lam=.95, compile_more=True,
                                pi_clip_value=0., no_sync=False, fused_adam=False, critic_epochs=1, critic_minibatches=1)
         ns = dict(torch=torch, nn=nn, mdp=self.mdp, motion=self.motion, pi=pi, critic=critic, wm=wm,
                   args=args, HZ=HZ, Hh=Hh, K=K, GRAPH=False, dev='cpu', MAX_STEP_REWARD=MAX_STEP_REWARD,

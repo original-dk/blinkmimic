@@ -156,16 +156,16 @@ class BodyReferenceTest(unittest.TestCase):
             self.assertTrue(torch.isfinite(dr).all())
             grad = torch.autograd.grad(dr.square().sum(), q)[0]
             self.assertTrue(torch.isfinite(grad).all())
-        # Three moving links plus the root: choose theta so mean-link angle^2 equals std^2.
-        theta = self.mdp.cfg.body_ori_std / math.sqrt(3/4)
+        # Three moving links plus the root: choose theta so summed link angle^2 equals sigma.
+        theta = math.sqrt(self.mdp.cfg.sigma_link_rotation / 3)
         q = m.q[f].clone(); q[:, 0] = theta
         S = (m.root_p[f], m.root_R[f], m.root_v[f], m.root_w[f], q, m.qd[f])
         init = torch.cat((S[0], mat_to_quat(S[1])), -1)
         _, terms = self.mdp.reward(S, f, torch.zeros(2, 3), torch.zeros(2, 3), terms=True, init_root=init, init_f=f)
-        reward_rot = torch.exp(-terms['e_body_ori']/self.mdp.cfg.body_ori_std**2)
+        reward_rot = torch.exp(-4*terms['e_body_ori']/self.mdp.cfg.sigma_link_rotation)
         torch.testing.assert_close(reward_rot, torch.full((2,), math.exp(-1)), atol=1e-6, rtol=1e-5)
 
-    def test_reward_aggregation_std_and_critic_share_every_diff(self):
+    def test_reward_aggregation_sigma_and_critic_share_every_diff(self):
         S, f = self.state(), self.f
         init = torch.cat((S[0], mat_to_quat(S[1])), -1)
         _, terms = self.mdp.reward(S, f, torch.zeros(2, 3), torch.zeros(2, 3), terms=True, init_root=init, init_f=f)
@@ -175,7 +175,8 @@ class BodyReferenceTest(unittest.TestCase):
         feat = self.mdp.critic_features(S, f, torch.zeros(2, 4), init, f)
         body = torch.cat([d.flatten(-2) for d in diffs], -1)
         torch.testing.assert_close(feat[:, 9:9+48], body, atol=0, rtol=0)
-        # Duplicate the same links: aggregation/reward scale must not depend on link count.
+        # Diagnostic mean errors stay comparable when links are duplicated. The configured
+        # reference position/rotation reward intentionally sums links; velocity reward averages them.
         expected = {k: terms[k] for k in ('e_body_pos', 'e_body_ori', 'e_body_linvel', 'e_body_angvel')}
         self.kin.tracked_idx *= 2
         self.update_bodies()

@@ -6,12 +6,11 @@ velocity of the root link frame, joint positions and velocities. ``J`` is the nu
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 
 from .kinematics import Kinematics
 from .motion import CONTROL_DT, MotionLib
+from .reward_cfg import REWARD_CFG
 from .rotations import mat_to_6d, mm3, mv3, quat_to_mat, mat_to_quat, so3_log, yaw_mat
 from .sensing import SensingCfg, obs_noise
 
@@ -32,24 +31,12 @@ def obs_scale(J: int) -> torch.Tensor:
 
 
 CONTACT_Z = 0.045  # ankle-roll link origin height below which a foot counts as in contact (as in tools/eval_metrics.py)
-MAX_STEP_REWARD = (4 * 1.0 + 4 * 0.5) * CONTROL_DT
-
-
-@dataclass
-class RewardCfg:
-    body_pos_std: float = 0.3
-    body_ori_std: float = 0.4
-    body_linvel_std: float = 1.0
-    body_angvel_std: float = 3.14
-    root_pos_std: float = 0.3
-    root_ori_std: float = 0.4
-    root_linvel_std: float = 1.0
-    root_angvel_std: float = 3.14
-    w_action_rate: float = -0.1
-    w_joint_limit: float = -2.0
-    soft_limit_factor: float = 0.9
-    term_height: float = 0.25
-    term_tilt: float = 0.8
+# Positive tracking upper bound; penalties and the optional contact bonus are excluded.
+MAX_STEP_REWARD = CONTROL_DT * sum((
+    REWARD_CFG.w_base_pos, REWARD_CFG.w_base_rotation, REWARD_CFG.w_base_lin_vel, REWARD_CFG.w_base_ang_vel,
+    REWARD_CFG.w_link_pos, REWARD_CFG.w_link_rotation, REWARD_CFG.w_link_lin_vel, REWARD_CFG.w_link_ang_vel,
+    REWARD_CFG.w_dofs_vel,
+))
 
 
 def flatten_state(S) -> torch.Tensor:
@@ -87,11 +74,11 @@ def inv_dim(J: int) -> int:
 
 class MDP:
     def __init__(self, kin: Kinematics, motion: MotionLib, default_q: torch.Tensor, xi_dim: int,
-                 sensing: SensingCfg = SensingCfg(), cfg: RewardCfg = RewardCfg()):  # fmt: skip
-        self.kin, self.motion, self.cfg = kin, motion, cfg
+                 sensing: SensingCfg = SensingCfg()):  # fmt: skip
+        self.kin, self.motion, self.cfg = kin, motion, REWARD_CFG
         self.default_q = default_q
         mid, half = (kin.q_lo + kin.q_hi) / 2, (kin.q_hi - kin.q_lo) / 2
-        self.soft_lo, self.soft_hi = mid - half * cfg.soft_limit_factor, mid + half * cfg.soft_limit_factor
+        self.soft_lo, self.soft_hi = mid - half * self.cfg.soft_limit_factor, mid + half * self.cfg.soft_limit_factor
         dev = default_q.device
         J = default_q.shape[0]
         self.num_j = J
@@ -197,7 +184,7 @@ class MDP:
         body_state = self.kin.forward(p, R, v, w, q, qd)
         bp, bR, bv, bw = body_state
         diff_pos, diff_rot, diff_lv, diff_av = self.body_diff(S, f, body_state)
-        # Mean squared vector norm over links: std is per-link distance / angle / speed, independent of link count.
+        # Diagnostic errors are mean squared vector norms; rewards below use the configured sigma aggregations.
         e_pos = (diff_pos ** 2).sum(-1).mean(-1)
         e_ori = (diff_rot ** 2).sum(-1).mean(-1)
         e_lv = (diff_lv ** 2).sum(-1).mean(-1)
@@ -207,19 +194,25 @@ class MDP:
         e_ro = (diff_ro ** 2).sum(-1)
         e_rlv = (diff_rlv ** 2).sum(-1)
         e_rav = (diff_rav ** 2).sum(-1)
+        e_jv = ((m.qd[f] - qd) ** 2).sum(-1)
+        n_links = diff_pos.shape[-2]
+        # Keep diagnostic errors as mean per-link vector norms. Reward sigma follows the reference
+        # directly: pos/rot sum all link components; velocities average all components (including xyz).
         r_track = (
-            torch.exp(-e_pos / c.body_pos_std**2)
-            + torch.exp(-e_ori / c.body_ori_std**2)
-            + torch.exp(-e_lv / c.body_linvel_std**2)
-            + torch.exp(-e_av / c.body_angvel_std**2)
-            + 0.5 * torch.exp(-e_rp / c.root_pos_std**2)
-            + 0.5 * torch.exp(-e_ro / c.root_ori_std**2)
-            + 0.5 * torch.exp(-e_rlv / c.root_linvel_std**2)
-            + 0.5 * torch.exp(-e_rav / c.root_angvel_std**2)
+            c.w_link_pos * torch.exp(-e_pos * n_links / c.sigma_link_pos)
+            + c.w_link_rotation * torch.exp(-e_ori * n_links / c.sigma_link_rotation)
+            + c.w_link_lin_vel * torch.exp(-e_lv / (3 * c.sigma_link_lin_vel))
+            + c.w_link_ang_vel * torch.exp(-e_av / (3 * c.sigma_link_ang_vel))
+            + c.w_base_pos * torch.exp(-e_rp / c.sigma_base_pos)
+            + c.w_base_rotation * torch.exp(-e_ro / c.sigma_base_rotation)
+            + c.w_base_lin_vel * torch.exp(-e_rlv / c.sigma_base_lin_vel)
+            + c.w_base_ang_vel * torch.exp(-e_rav / c.sigma_base_ang_vel)
+            + c.w_dofs_vel * torch.exp(-e_jv / c.sigma_dofs_vel)
         )
         r_rate = ((a - a_prev) ** 2).sum(-1)
+        r_mag = (a ** 2).sum(-1)
         r_lim = (torch.relu(q - self.soft_hi) + torch.relu(self.soft_lo - q)).sum(-1)
-        r = (r_track + c.w_action_rate * r_rate + c.w_joint_limit * r_lim) * CONTROL_DT
+        r = (r_track + c.w_action_rate * r_rate + c.w_action_magnitude * r_mag + c.w_joint_limit * r_lim) * CONTROL_DT
         if w_contact > 0:
             fz, rz = bp[..., self.feet, 2], m.body_p[f][..., self.feet, 2]
             c_sim = torch.sigmoid((CONTACT_Z - fz) / 0.005)
@@ -239,7 +232,9 @@ class MDP:
                 "e_root_angvel": e_rav,
                 "e_body_linvel": e_lv,
                 "e_body_angvel": e_av,
+                "e_joint_vel": e_jv,
                 "action_rate": r_rate,
+                "action_magnitude": r_mag,
                 "joint_limit": r_lim,
             }
         return r

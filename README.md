@@ -157,16 +157,38 @@ layouts. This changes the critic input dimension: start a new training run rathe
 Body rewards and critic features share four link diffs, each with shape `(batch, links, 3)`. The reference
 uses its current base frame; the robot uses a hybrid frame with its own current yaw and the reference's
 current roll/pitch. Positions subtract each own base position. Linear/angular velocities are rotated into
-those frames without subtracting base velocity. Rotation is a shortest-path 3D rotation vector of
-`inverse(robot_local_quat) * reference_local_quat`, in radians.
+those frames without subtracting base velocity. Rotation is a shortest-path 3D rotation vector, in radians.
+At a vertical forward axis, where yaw is undefined, hybrid construction uses a zero heading.
 
-Each body reward is `exp(-mean_links(sum_xyz(diff**2)) / std**2)`. This averages squared vector norms over
-links, so the denominator does not scale with link count. Defaults remain `body_pos_std=0.3` meters,
-`body_ori_std=0.4` radians, `body_linvel_std=1.0` m/s and `body_angvel_std=3.14` rad/s; an error equal to its std
-on every link gives reward `exp(-1)`. These are std parameters, equivalent to `sigma=std**2` in a direct
-sigma denominator. The critic now receives all four flattened body diffs instead of the old body position
-error only; its input dimension changes again, so use a new training run. At a vertical forward axis, where
-yaw is undefined, hybrid construction uses a zero heading rather than a degenerate rotation.
+### Reward configuration
+
+All reward settings live in [`src/blinkmimic/reward_cfg.py`](src/blinkmimic/reward_cfg.py). The active
+`REWARD_CFG` uses the supplied reference sigma values and weights. The preceding branch configuration is
+kept as a commented alternative in that same file; keep only one assignment active. There is no reward
+preset flag or automatic checkpoint override. Edit the file and restart training/evaluation to use new values.
+
+Sigma is used directly in `weight * exp(-error / sigma)`:
+
+- Base position/rotation/velocity and joint velocity errors sum their vector/joint components.
+- Link position and 3D rotvec errors sum every link/component.
+- Link velocity errors average every link/component, including XYZ.
+
+The diagnostic `e_body_*` values remain mean per-link squared vector norms for comparable error metrics;
+`mdp.reward()` applies the link-count / XYZ factors explicitly to obtain the configured sum/mean rewards.
+No sigma-to-std conversion is needed in the configuration file.
+
+The active positive reward weights sum to 3.0, giving `MAX_STEP_REWARD = 3.0 * CONTROL_DT` (0.06 at 50 Hz).
+This is derived from the active weights and used for training/evaluation normalization and reset sampling.
+Action-rate and action-magnitude penalties are each -0.01; joint-limit and optional contact weights are zero.
+The optional training-only contact weight is also configured here, rather than through a training flag.
+Optimizer/system presets do not override reward weights.
+
+Training and evaluation always read the current file, including when evaluating an older checkpoint.
+Changing it also changes the reward used to score older policies. Use a fresh training directory after a
+reward change, and keep the same file version when comparing runs. Renderers only display recorded states.
+Actor observations and commands, base/body diff definitions and critic layout are unaffected by changing
+reward coefficients. The critic receives all four body diffs and all four base diffs; old critic layouts
+still require a new training run.
 
 ### 2. Evaluate and record multiple random episodes
 
