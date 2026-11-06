@@ -96,7 +96,7 @@ class MDP:
         J = default_q.shape[0]
         self.num_j = J
         self.obs_dim, self.xi_dim = obs_dim(J), xi_dim
-        self.critic_extra = J + len(kin.tracked_idx) * 3 + 3 + 6 + self.xi_dim
+        self.critic_dim = 3 * J + len(kin.tracked_idx) * 3 + 12 + self.xi_dim
         self.obs_noise = obs_noise(sensing, J).to(dev)
         self.obs_scale = obs_scale(J).to(dev)
         # InstantTrack contact reward (training only): tracked-body indices of the feet, set by the trainer
@@ -229,8 +229,13 @@ class MDP:
         alive = (1 - torch.sigmoid((e_z - self.cfg.term_height) / tz)) * (1 - torch.sigmoid((e_tilt - self.cfg.term_tilt) / tt))
         return 1 - alive
 
-    def critic_features(self, S, f, xi) -> torch.Tensor:
-        """Critic input: invariant state, goal, sim context, and robot-vs-reference errors."""
+    def critic_features(self, S, f, xi, init_root, init_f) -> torch.Tensor:
+        """Joints, body error, the reward's four base diffs, and sim context (goal appended by trainer).
+
+        Base height, tilt, raw local velocities and absolute root pose errors are replaced by the
+        same 12 base-diff components used by reward. Reset context is required for every sample.
+        """
+        assert init_root is not None and init_f is not None, "critic needs each sample's reset pose and expert frame"
         m = self.motion
         p, R, v, w, q, qd = S
         H = yaw_mat(R)
@@ -241,6 +246,5 @@ class MDP:
         anchor = torch.cat((p[..., :2], rp[..., 2:3]), -1)
         ref_bp = anchor.unsqueeze(-2) + mv3(dR.unsqueeze(-3), m.body_p[f] - rp.unsqueeze(-2))
         e_body = mv3(Ht.unsqueeze(-3), ref_bp - bp).flatten(-2)
-        e_root = mv3(Ht, rp - p)
-        rel = mat_to_6d(mm3(R.transpose(-1, -2), rR))
-        return torch.cat((invariant_features(S), m.q[f] - q, e_body, e_root, rel, xi), -1)
+        diff_pos, diff_rot, diff_lv, diff_av = self.base_diff(S, f, init_root, init_f)
+        return torch.cat((q, qd, m.q[f] - q, e_body, diff_pos, diff_rot, diff_lv, diff_av, xi), -1)

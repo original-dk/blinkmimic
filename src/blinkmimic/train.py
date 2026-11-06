@@ -147,7 +147,7 @@ from blinkmimic.buffer import ReplayBuffer
 from blinkmimic.dr import XiLayout
 from blinkmimic.env import PHYSICS_DT, TrackingSim, make_sim
 from blinkmimic.kinematics import Kinematics
-from blinkmimic.mdp import MAX_STEP_REWARD, MDP, inv_dim, unflatten_state
+from blinkmimic.mdp import MAX_STEP_REWARD, MDP, unflatten_state
 from blinkmimic.motion import CONTROL_DT, MotionLib
 import blinkmimic.networks as networks
 import blinkmimic.rotations as rotations
@@ -183,7 +183,7 @@ mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev),
 pipe = ObsPipeline(robot, mdp, layout, dev, PHYSICS_DT)
 K, Hh, HZ = args.goal_frames, args.hist, args.horizon
 GOAL_DIM = motion.goal_dim(K)
-CRITIC_IN = inv_dim(J) + mdp.critic_extra + GOAL_DIM
+CRITIC_IN = mdp.critic_dim + GOAL_DIM
 
 widths = lambda s: tuple(int(x) for x in s.split(","))  # noqa: E731
 networks.RunningNorm.no_sync = args.no_sync
@@ -240,6 +240,8 @@ if args.resume:
     # live policy comes from "pi_live" and the average from "pi_avg"
     ck = torch.load(args.resume, map_location=dev, weights_only=False)
     assert "opt_pi" in ck, f"--resume {args.resume}: no optimizer state (use last.pt)"
+    if ck["critic"]["net.0.weight"].shape[1] != CRITIC_IN:
+        raise ValueError("--resume critic input layout differs (base diffs replaced the old base observations); start a new run")
     check_pruned(ck.get("args", {}), what=args.resume)
     wm.load_state_dict(ck["wm"]), pi.load_state_dict(ck.get("pi_live", ck["pi"])), critic.load_state_dict(ck["critic"])
     load_opt_states(ck)
@@ -333,8 +335,8 @@ def _wm_norm_data(S0, S1, a, a_prev, xi):
     return wm.inputs(S0, a, a_prev, normalize_xi(xi)), wm.targets(S0, S1), WorldModel.increments(S0, S1)
 
 
-def _critic_input(S, f, xi_n, g):
-    return torch.cat((mdp.critic_features(S, f, xi_n), g), -1)
+def _critic_input(S, f, xi_n, g, init_root, init_f):
+    return torch.cat((mdp.critic_features(S, f, xi_n, init_root, init_f), g), -1)
 
 
 wm_rollout = torch.compile(_wm_rollout)
@@ -481,7 +483,8 @@ def policy_update():
     init_f = s["init_f"].unsqueeze(0).expand(HZ, -1).flatten()
     r, d = reward_term(S_all, f_all, flat(As), flat(Aps), init_root, init_f)
     r, d = r.view(HZ, B), d.view(HZ, B)
-    v_boot = critic((critic_input_c if args.compile_more else _critic_input)(S, f, xi_n, g))
+    v_boot = critic((critic_input_c if args.compile_more else _critic_input)(
+        S, f, xi_n, g, s["init_root"], s["init_f"]))
     # --cuda_graph: survival products as a loop (cumprod's backward reads the host)
     J, c_t, c = actor_objective(r, d, v_boot, args.gamma, loop_cumprod=GRAPH)
     r_sum = (c_t * r).detach().sum(0)
@@ -527,7 +530,9 @@ def policy_update():
         f_c = torch.cat((s["f"].unsqueeze(0), torch.stack(Fs)), 0).flatten()
         g_c = torch.cat((g0.unsqueeze(0), torch.stack(Gs)), 0).flatten(0, 1)
         xi_c = xi_n.unsqueeze(0).expand(HZ + 1, -1, -1).flatten(0, 1)
-        X = critic_input_c(S_c, f_c, xi_c, g_c).view(HZ + 1, B, -1)
+        init_root_c = s["init_root"].unsqueeze(0).expand(HZ + 1, -1, -1).flatten(0, 1)
+        init_f_c = s["init_f"].unsqueeze(0).expand(HZ + 1, -1).flatten()
+        X = critic_input_c(S_c, f_c, xi_c, g_c, init_root_c, init_f_c).view(HZ + 1, B, -1)
     critic.norm.update(X)
     with torch.no_grad():
         targets = (gae_targets_c if args.fused_adam else _gae_targets)(critic(X), rews, dones)  # (H, B)

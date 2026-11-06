@@ -147,6 +147,13 @@ expert motion. Root position and orientation rewards compare robot and expert ch
 initial root frames: the robot uses its pose after reset randomization, and the expert uses the sampled frame
 before randomization. The reset context is also retained in replay and imagined rollouts.
 
+The critic uses those same four base diffs (position, quaternion rotation, local linear velocity and local
+angular velocity; 12 components total). They replace its previous base height, tilt, raw local velocities
+and absolute root pose errors. Both the actor's value bootstrap and critic targets receive each replay
+sample's reset context. Actor observations, motion commands and world-model inputs retain their current
+layouts. This changes the critic input dimension: start a new training run rather than resuming an older
+`last.pt` with the previous critic layout. Existing policy-only checkpoints remain usable for evaluation.
+
 ### 2. Evaluate and record multiple random episodes
 
 ```bash
