@@ -93,9 +93,11 @@ Foot slip of the reference motion itself: 10.2 cm/s.
 | imagined-rollout batch (policy and critic) | 4096 | 4096 | 2048, policy learning rate 4×, decayed to 1× over 300 iterations once the training return reaches 0.75 (by iteration 1400) | `--pi_batch --pi_lr_mult --lr_decay_*` |
 | collection step, episode resets and probe sweep as CUDA graphs; sweep on a side stream; checkpoints written by a background thread | – | – | ✓ | `--graph_early --collect_graph --reset_masked --eprobe_graph --eprobe_async --ckpt_light` |
 
-The released recipe is `PRESET[main]` in [`scripts/presets.sh`](scripts/presets.sh). `python -m blinkmimic.train`
-without flags uses the SuperMimic optimizer settings. On this branch, the simulator and MDP also use the
-relative reset rewards and robot yaw randomization described below.
+The table describes the released recipe. On this branch, `PRESET[main]` in
+[`scripts/presets.sh`](scripts/presets.sh) reduces simulator/replay/batch sizes and disables probes for
+large motion libraries, as described below. `python -m blinkmimic.train` without flags uses the SuperMimic
+optimizer settings with these smaller sizes. The simulator and MDP also use the relative reset rewards
+and robot yaw randomization described below.
 
 ## Setup
 
@@ -142,16 +144,23 @@ PYTHON=python bash scripts/train_bones32.sh logs/bones_s0 \
   --motion_dir /path/to/bones --motion_quat_order wxyz --seed 0
 ```
 
-The entry point loads **all matching files**, including subdirectories. It uses 2048 simulator worlds,
-500 replay steps, world-model/policy batches of 1024, a 200-step training episode limit, and disables
-eprobe. Extra flags override these defaults. Actor commands, reset-relative diffs and reward coefficients
-retain their definitions. Reward settings remain in `reward_cfg.py`. Without this entry point, eprobe
-now caps simultaneous probe worlds at `--eprobe_envs 4096`, sampling tiles from the full candidate set
+The entry point loads **all matching files**, including subdirectories. Both `scripts/train.sh` and this
+entry point now use 2048 simulator worlds, 500 replay steps and world-model/policy batches of 1024, with
+eprobe disabled. `train_bones32.sh` additionally sets a 200-step episode limit and a long training budget.
+Extra flags override these defaults. Startup prints the effective sizes so accidental overrides are visible.
+Actor commands, reset-relative diffs and reward coefficients
+retain their definitions. Reward settings remain in `reward_cfg.py`. If explicitly enabled, eprobe
+caps simultaneous probe worlds at `--eprobe_envs 512`, sampling tiles from the full candidate set
 per sweep. Use `--eprobe_share 0 --eprobe_async 0` to disable it entirely.
 Terminal-only reset bins reuse the last valid transition; imagined references clamp to the clip end and
 returns/bootstrap stop there, so short clips and tail frames cannot index into the next motion.
 
-Startup prints actual motion/replay storage. TensorBoard `memory/*` records PyTorch allocated, reserved
+Startup and graph-capture messages show actual whole-device use/free memory as well as PyTorch storage.
+MuJoCo/Warp can occupy substantial VRAM even when PyTorch's reserved figure looks small. Update graphs
+reuse their warmup stream; before the policy graph is ready, unused eager-backward cache is released
+between iterations so it cannot crowd out Warp's next simulator replay. This cleanup is only a startup
+step, not a cache flush on every steady-state update.
+TensorBoard `memory/*` records PyTorch allocated, reserved
 and peak memory, plus sampled whole-device use (which also includes MuJoCo/Warp). Training failures are
 propagated through `scripts/train.sh` rather than hidden by its `tee` pipeline.
 
@@ -181,7 +190,7 @@ PYTHON=python bash scripts/train.sh logs/run_no_rel_s0 \
 ```
 
 This uses `PRESET[main]`, writes logs to `logs/run_no_rel_s0`, and saves policy checkpoints such as
-`logs/run_no_rel_s0/ckpt_003500.pt`. On a shared GPU, append `--eprobe_async 0` as noted below.
+`logs/run_no_rel_s0/ckpt_003500.pt`. Probes are disabled by default on this branch.
 
 Use `--max_episode_steps 200` to cap training episodes at 4 seconds (50 Hz). The default is 500 steps
 (10 seconds); motion endings or failures can end an episode earlier. This setting only limits training
@@ -428,7 +437,7 @@ videos or returns against `evaluateran` / `render_ran.py`.
 > add `--eprobe_async 0` there.
 
 ```bash
-bash scripts/train.sh logs/run_s0 --seed 0          # ~8 min: 3500 iterations, a policy checkpoint every 100
+bash scripts/train.sh logs/run_s0 --seed 0          # 3500 iterations, a policy checkpoint every 100
 uv run python tools/eval_batch.py --run_dir logs/run_s0 --group 18 --reps 4   # 18 checkpoints per batch
 uv run python tools/time_to_target.py logs/run_s0
 bash scripts/reproduce.sh logs/reproduce             # the table above: 3 seeds, evaluation, time to target

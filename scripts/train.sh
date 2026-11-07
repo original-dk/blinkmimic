@@ -1,7 +1,7 @@
 #!/bin/bash
-# Train with the released recipe (scripts/presets.sh, PRESET[main]).
+# Train with this branch's memory-bounded recipe (scripts/presets.sh, PRESET[main]).
 # Usage: bash scripts/train.sh <log_dir> [extra train.py flags, e.g. --seed 1]
-# About 7.8 min of training on an RTX 4090 for 3500 iterations. Python: $PYTHON, default "uv run python".
+# Python: $PYTHON, default "uv run python".
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source scripts/presets.sh

@@ -4,6 +4,7 @@ Run: python tools/test_compact_motion.py
 """
 
 import ast
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
@@ -203,6 +204,12 @@ class CompactMotionTest(unittest.TestCase):
         for key, value in dict(num_envs=2048, buffer_steps=500, pi_batch=1024, wm_batch=1024,
                                eprobe_share=0, eprobe_async=0, max_episode_steps=200).items():
             self.assertEqual(args[key], value)
+        common = ['bash', str(repo/'scripts/train.sh'), str(self.root/'common-logs'), '--motion_dir', str(self.root)]
+        default = subprocess.run(common, env=env, text=True, capture_output=True)
+        self.assertEqual(default.returncode, 0, default.stderr+default.stdout)
+        common_args = json.loads(default.stdout)
+        for key in ('num_envs', 'buffer_steps', 'pi_batch', 'wm_batch', 'eprobe_share', 'eprobe_async'):
+            self.assertEqual(common_args[key], args[key])
         override = subprocess.run(cmd+['--num_envs', '1024'], env=env, text=True, capture_output=True)
         self.assertEqual(json.loads(override.stdout)['num_envs'], 1024)
         failed = subprocess.run(cmd+['--invalid-option'], env=env, text=True, capture_output=True)
@@ -222,7 +229,7 @@ class CompactMotionTest(unittest.TestCase):
         ns = dict(torch=torch, time=time, args=args, motion=m, EPROBE=True, dev='cpu',
                   pi_avg=SimpleNamespace(module=Mock()), robot=Mock(), mdp=Mock(),
                   TrackingSim=factory, make_sim=Mock(return_value=None),
-                  eprobe_sweep_eager=Mock(return_value=torch.full((2,), -1)), eprobe_finish=Mock())
+                  eprobe_sweep_eager=Mock(return_value=torch.full((2,), -1)), eprobe_finish=Mock(), cuda_memory_report=Mock())
         exec(compile(ast.Module(body=[init, burst], type_ignores=[]), str(source), 'exec'), ns)
         self.assertEqual(ns['P_EP'], 2)
         self.assertGreater(len(ns['EP_TILE']), 2)
@@ -246,6 +253,56 @@ class CompactMotionTest(unittest.TestCase):
         self.assertFalse(report['passed'])
         self.assertEqual(report['returncode'], 2)
         self.assertEqual(report['last_logged_iteration'], 0)
+
+    def test_update_graph_reuses_its_warmup_stream_for_capture(self):
+        source = Path(__file__).parents[1]/'src/blinkmimic/train.py'
+        cls = next(n for n in ast.parse(source.read_text()).body if isinstance(n, ast.ClassDef) and n.name == 'Graphed')
+        stream, current, graph = Mock(), Mock(), Mock()
+        cuda = SimpleNamespace(Stream=Mock(return_value=stream), current_stream=Mock(return_value=current),
+                               stream=Mock(side_effect=lambda s: nullcontext()), synchronize=Mock(), empty_cache=Mock(),
+                               CUDAGraph=Mock(return_value=graph), graph=Mock(side_effect=lambda *a, **k: nullcontext()))
+        import time
+        ns = dict(torch=SimpleNamespace(cuda=cuda), time=time, cuda_memory_report=Mock())
+        exec(compile(ast.Module(body=[cls], type_ignores=[]), str(source), 'exec'), ns)
+        calls = []
+        def update():
+            calls.append(1)
+            return (torch.tensor(float(len(calls))),)
+        wrapped = ns['Graphed'](update, lambda: True)
+        outputs = [wrapped() for _ in range(5)]
+        self.assertEqual(cuda.Stream.call_count, 1)
+        cuda.graph.assert_called_once_with(graph, stream=stream)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(graph.replay.call_count, 2)
+        self.assertNotEqual(outputs[-1][0].data_ptr(), wrapped.out[0].data_ptr())
+
+    def test_eager_cache_release_only_runs_before_policy_graph_is_ready(self):
+        source = Path(__file__).parents[1]/'src/blinkmimic/train.py'
+        node = next(n for n in ast.walk(ast.parse(source.read_text())) if isinstance(n, ast.If)
+                    and 'policy_update_g.graph is None' in ast.unparse(n.test))
+        cuda = SimpleNamespace(synchronize=Mock(), empty_cache=Mock())
+        policy = SimpleNamespace(graph=None)
+        ns = dict(torch=SimpleNamespace(cuda=cuda), GRAPH=True, args=SimpleNamespace(graph_early=True),
+                  policy_update_g=policy, cuda_memory_report=Mock())
+        code = compile(ast.Module(body=[node], type_ignores=[]), str(source), 'exec')
+        exec(code, ns)
+        cuda.empty_cache.assert_called_once()
+        policy.graph = object()
+        exec(code, ns)
+        cuda.empty_cache.assert_called_once()
+
+    def test_memory_report_includes_non_torch_device_use(self):
+        source = Path(__file__).parents[1]/'src/blinkmimic/train.py'
+        fn = next(n for n in ast.parse(source.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == 'cuda_memory_report')
+        cuda = SimpleNamespace(mem_get_info=lambda: (3*2**30, 32*2**30),
+                               memory_allocated=lambda: 4*2**30, memory_reserved=lambda: 6*2**30)
+        ns = dict(torch=SimpleNamespace(cuda=cuda))
+        exec(compile(ast.Module(body=[fn], type_ignores=[]), str(source), 'exec'), ns)
+        with patch('builtins.print') as output:
+            ns['cuda_memory_report']('test')
+        self.assertIn('reserved 6.00 GiB', output.call_args.args[0])
+        self.assertIn('device used 29.00 GiB', output.call_args.args[0])
+        self.assertIn('free 3.00/32.00 GiB', output.call_args.args[0])
 
 
 if __name__ == '__main__':

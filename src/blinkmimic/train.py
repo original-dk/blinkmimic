@@ -15,19 +15,19 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--robot", type=str, default="g1", help="robot package under blinkmimic/ (g1)")
-parser.add_argument("--num_envs", type=int, default=4096)
+parser.add_argument("--num_envs", type=int, default=2048)
 parser.add_argument("--max_episode_steps", type=int, default=500,
                     help="maximum training episode length in control steps (50 Hz; default: 500 = 10 s)")
 parser.add_argument("--iterations", type=int, default=320_000)
-parser.add_argument("--buffer_steps", type=int, default=1000)
+parser.add_argument("--buffer_steps", type=int, default=500)
 parser.add_argument("--utd", type=float, default=0.4, help="updates per vectorized simulator step")
 parser.add_argument("--horizon", type=int, default=32)
 parser.add_argument("--goal_frames", type=int, default=10)
 parser.add_argument("--hist", type=int, default=10)
 parser.add_argument("--wm_window", type=int, default=8)
 parser.add_argument("--wm_batches", type=int, default=10)
-parser.add_argument("--wm_batch", type=int, default=2048)
-parser.add_argument("--pi_batch", type=int, default=4096)
+parser.add_argument("--wm_batch", type=int, default=1024)
+parser.add_argument("--pi_batch", type=int, default=1024)
 parser.add_argument("--lr", type=float, default=2e-4)
 parser.add_argument("--gamma", type=float, default=0.99)
 parser.add_argument("--lam", type=float, default=0.95)
@@ -85,7 +85,7 @@ parser.add_argument("--eprobe_share", type=float, default=0.0,
                          "evaluation simulator. Tiles are spaced by --eprobe_tile frames, started a random lead in "
                          "[--eprobe_lead_min, --eprobe_lead_max] frames earlier on the reference")
 parser.add_argument("--eprobe_tile", type=int, default=300)
-parser.add_argument("--eprobe_envs", type=int, default=4096, help="maximum simultaneous probe worlds; sample tiles per sweep")
+parser.add_argument("--eprobe_envs", type=int, default=512, help="maximum simultaneous probe worlds; sample tiles per sweep")
 parser.add_argument("--eprobe_lead_min", type=int, default=200)
 parser.add_argument("--eprobe_lead_max", type=int, default=450)
 parser.add_argument("--eprobe_every", type=int, default=250)
@@ -174,6 +174,17 @@ networks.AMP_DTYPE = torch.bfloat16 if args.amp == "bf16" else None
 dev = "cuda:0"
 os.makedirs(args.log_dir, exist_ok=True)
 json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent=2)
+print(f"training: envs={args.num_envs}, replay_steps={args.buffer_steps}, "
+      f"wm_batch={args.wm_batch}, pi_batch={args.pi_batch}, "
+      f"eprobe_share={args.eprobe_share}, eprobe_async={args.eprobe_async}", flush=True)
+
+
+def cuda_memory_report(label):
+    """Include device-wide use: MuJoCo/Warp allocations do not all appear in PyTorch's allocator."""
+    free, total = torch.cuda.mem_get_info()
+    print(f"{label}: Torch allocated {torch.cuda.memory_allocated() / 2**30:.2f} GiB, "
+          f"reserved {torch.cuda.memory_reserved() / 2**30:.2f} GiB; "
+          f"device used {(total-free) / 2**30:.2f} GiB, free {free / 2**30:.2f}/{total / 2**30:.2f} GiB", flush=True)
 
 robot = get_robot(args.robot)
 if args.yaw_degrees is not None or args.xy_range is not None:
@@ -188,6 +199,7 @@ kin = Kinematics(robot, dev)
 motion = MotionLib.from_dir(args.motion_dir or robot.motion_dir, robot, kin, dev, args.motion_quat_order)
 print(f"motion: {len(motion.names)} clips, {motion.num_frames:,} frames, "
       f"{motion.storage_bytes / 2**30:.2f} GiB stored (root XYZ FP32, other state FP16; reference FK per batch)", flush=True)
+cuda_memory_report("after motion load")
 layout = XiLayout(robot, dev)
 normalize_xi = layout.normalize
 mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), layout.dim, robot.sensing)
@@ -436,13 +448,16 @@ class Graphed:
 
     def __init__(self, fn, ready, warmup: int = 3):
         self.fn, self.ready, self.warmup, self.calls, self.graph, self.out = fn, ready, warmup, 0, None, None
+        self.stream = None
 
     def __call__(self):
         if self.graph is None and not self.ready():
             return self.fn()
         self.calls += 1
         if self.calls <= self.warmup:
-            side = torch.cuda.Stream()
+            if self.stream is None:
+                self.stream = torch.cuda.Stream()
+            side = self.stream
             side.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side):
                 out = self.fn()
@@ -453,11 +468,10 @@ class Graphed:
             torch.cuda.empty_cache()  # return the eager phase's cached blocks before the graph takes its own pool
             t0 = time.time()
             self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph):
+            with torch.cuda.graph(self.graph, stream=self.stream):
                 self.out = self.fn()
             torch.cuda.synchronize()
-            print(f"cuda_graph: captured {self.fn.__name__} in {time.time() - t0:.1f} s, "
-                  f"{torch.cuda.memory_reserved() / 2**30:.1f} GB reserved", flush=True)  # fmt: skip
+            cuda_memory_report(f"cuda_graph: captured {self.fn.__name__} in {time.time() - t0:.1f} s")
         self.graph.replay()
         return tuple(x.clone() for x in self.out)
 
@@ -578,9 +592,8 @@ if INIT_BINS is not None:  # --resume: the checkpoint's reset-sampler statistics
     env.bin_G.copy_(INIT_BINS["bin_G"]), env.bin_fail.copy_(INIT_BINS["bin_fail"]), env.bin_w_avg.copy_(INIT_BINS["bin_w_avg"])
 buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev, J, layout.dim,
                       mdp.obs_dim if pipe.stateful else None, pipe.state_dim if pipe.stateful else None)  # fmt: skip
-print(f"replay: {buffer.storage_bytes / 2**30:.2f} GiB; "
-      f"CUDA allocated {torch.cuda.memory_allocated() / 2**30:.2f} GiB, "
-      f"reserved {torch.cuda.memory_reserved() / 2**30:.2f} GiB", flush=True)
+print(f"replay: {buffer.storage_bytes / 2**30:.2f} GiB", flush=True)
+cuda_memory_report("after training env + replay")
 obs_hist = torch.zeros(args.num_envs, Hh, mdp.obs_dim, device=dev)
 
 
@@ -651,7 +664,7 @@ def collect_graphed_step():
         finally:
             TorchArray.__setitem__, env.sim.use_cuda_graph = setitem, True
         torch.cuda.synchronize()
-        print(f"--collect_graph: captured one collection step in {time.time() - t0:.1f} s", flush=True)
+        cuda_memory_report(f"--collect_graph: captured one collection step in {time.time() - t0:.1f} s")
         CG["graph"].replay()  # the capture itself does not run the step
         out = CG["out"]
     else:
@@ -737,6 +750,9 @@ if EPROBE:
     _nxt = torch.arange(motion.num_bins, device=dev) + 1
     EP_NEXT = torch.where((_nxt < motion.num_bins) & (motion.bin_clip[_nxt.clamp(max=motion.num_bins - 1)] == motion.bin_clip), _nxt, _nxt - 1)
     print(f"--eprobe: {P_EP} probe worlds for {len(EP_TILE)} tiles (sampled per sweep)", flush=True)
+    cuda_memory_report("after eprobe env")
+else:
+    print("--eprobe: disabled", flush=True)
 
 
 @torch.no_grad()
@@ -984,6 +1000,12 @@ for it in range(start_it, args.iterations):
     if POLICY_START is not None and it >= POLICY_START:
         n_avg0 = int(pi_avg.n_averaged) if pi_avg is not None else 0
         pl, vl, ir, gn, surv = policy_update_g()
+        if GRAPH and args.graph_early and policy_update_g.graph is None:
+            # Warp cannot reclaim PyTorch's unused eager-backward blocks at the next simulator replay.
+            # Release only during graph startup; steady-state graph replays keep their pools intact.
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            cuda_memory_report("after uncaptured policy update")
         if GRAPH and pi_avg is not None and int(pi_avg.n_averaged) == n_avg0:
             pi_avg.n_averaged += 1  # ema_update (and a graph replay) does not advance the host-side counter
         agg["pi"].append(pl), agg["v"].append(vl), agg["ir"].append(ir), agg["gn"].append(gn), agg["surv"].append(surv)
