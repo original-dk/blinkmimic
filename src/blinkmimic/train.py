@@ -16,6 +16,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 parser = argparse.ArgumentParser()
 parser.add_argument("--robot", type=str, default="g1", help="robot package under blinkmimic/ (g1)")
 parser.add_argument("--num_envs", type=int, default=4096)
+parser.add_argument("--max_episode_steps", type=int, default=500,
+                    help="maximum training episode length in control steps (50 Hz; default: 500 = 10 s)")
 parser.add_argument("--iterations", type=int, default=320_000)
 parser.add_argument("--buffer_steps", type=int, default=1000)
 parser.add_argument("--utd", type=float, default=0.4, help="updates per vectorized simulator step")
@@ -133,6 +135,8 @@ parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--resume", type=str, default=None)
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 args = parser.parse_args()
+if args.max_episode_steps <= 0:
+    parser.error("--max_episode_steps must be positive")
 if args.yaw_degrees is not None and not 0 <= args.yaw_degrees <= 180:
     parser.error("--yaw_degrees must be between 0 and 180")
 if args.xy_range is not None and (not all(math.isfinite(x) for x in args.xy_range) or args.xy_range[0] > args.xy_range[1]):
@@ -557,7 +561,8 @@ if args.compile_more:
     # the simulator wrapper calls these once per control step in eager mode otherwise (FK + rotations: thousands of kernels)
     mdp.reward, mdp.termination, mdp.obs = torch.compile(mdp.reward), torch.compile(mdp.termination), torch.compile(mdp.obs)
     motion.goal = torch.compile(motion.goal)
-env = TrackingSim(sim_cfg, args.num_envs, robot, motion, mdp, dev, gamma=args.gamma, fail_reset=args.fail_reset, bin_fix=args.bin_fix)
+env = TrackingSim(sim_cfg, args.num_envs, robot, motion, mdp, dev, gamma=args.gamma,
+                  max_episode_steps=args.max_episode_steps, fail_reset=args.fail_reset, bin_fix=args.bin_fix)
 if INIT_BINS is not None:  # --resume: the checkpoint's reset-sampler statistics (episodes already running keep their start)
     env.bin_G.copy_(INIT_BINS["bin_G"]), env.bin_fail.copy_(INIT_BINS["bin_fail"]), env.bin_w_avg.copy_(INIT_BINS["bin_w_avg"])
 buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev, J, layout.dim,

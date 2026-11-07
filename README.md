@@ -129,6 +129,12 @@ PYTHON=python bash scripts/train.sh logs/run_no_rel_s0 \
 This uses `PRESET[main]`, writes logs to `logs/run_no_rel_s0`, and saves policy checkpoints such as
 `logs/run_no_rel_s0/ckpt_003500.pt`. On a shared GPU, append `--eprobe_async 0` as noted below.
 
+Use `--max_episode_steps 200` to cap training episodes at 4 seconds (50 Hz). The default is 500 steps
+(10 seconds); motion endings or failures can end an episode earlier. This setting only limits training
+collection: evaluation continues to the motion's end, and `--wm_window` / `--horizon` retain their values.
+Each new episode samples a fresh reset pose and reference frame. Compare long evaluation rollouts when
+checking drift, since shorter training episodes also shorten the time available for position error to accumulate.
+
 Training samples a motion time bin using return/failure statistics, then a frame inside that bin. Each reset
 adds an independent, continuous uniform robot yaw offset in **[-90°, +90°]**, on top of the original reset noise.
 The world linear and angular velocities rotate with that yaw. Use `--yaw_degrees 90` to set this half-range,
