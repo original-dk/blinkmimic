@@ -118,7 +118,8 @@ class CriticBaseDiffTest(unittest.TestCase):
                   args=args, HZ=HZ, Hh=Hh, K=K, GRAPH=False, dev='cpu', MAX_STEP_REWARD=MAX_STEP_REWARD,
                   unflatten_state=unflatten_state, normalize_xi=lambda x: x,
                   sample_valid_starts=lambda n: (s, h), pipe=SimpleNamespace(stateful=False), pi_avg=None,
-                  actor_objective=actor_objective, set_requires_grad=lambda model, flag: model.requires_grad_(flag),
+                  actor_objective=actor_objective, POLICY_BATCH=None,
+                  set_requires_grad=lambda model, flag: model.requires_grad_(flag),
                   opt_pi=torch.optim.Adam(pi.parameters(), lr=1e-4), opt_v=torch.optim.Adam(critic.parameters(), lr=1e-4))
         exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), 'exec'), ns)
         calls = []

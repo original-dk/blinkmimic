@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 import os
 import sys
 import time
@@ -27,6 +28,7 @@ parser.add_argument("--watch", action="store_true")
 parser.add_argument("--ckpt", type=str, default=None, help="evaluate one checkpoint")
 parser.add_argument("--record", type=str, default=None, help="save trajectories (npz) for rendering")
 parser.add_argument("--motion_dir", type=str, default=None, help="defaults to the robot's motion directory")
+parser.add_argument("--motion_cache_gib", type=float, default=0, help="FP32 CPU library with bounded GPU cache; 0 disables")
 parser.add_argument("--motion_quat_order", choices=["wxyz", "xyzw"], default="wxyz",
                     help="NPZ root quaternion order (default: wxyz); CSV keeps the robot's format")
 parser.add_argument("--every", type=int, default=1, help="evaluate every n-th checkpoint")
@@ -36,6 +38,8 @@ parser.add_argument("--dr_parts", type=str, default="all", choices=["all", "dyna
 parser.add_argument("--repeats", type=int, default=1, help="rollouts per clip")
 parser.add_argument("--seed", type=int, default=0)
 args = parser.parse_args()
+if not math.isfinite(args.motion_cache_gib) or args.motion_cache_gib < 0:
+    parser.error("--motion_cache_gib must be finite and nonnegative")
 
 import dataclasses
 import re
@@ -84,7 +88,8 @@ if args.dr_from:
     robot = transfer_dr(robot, robot if args.dr_from == "self" else get_robot(args.dr_from), args.dr_parts)
     print("pd_gain_scale on this robot:", robot.dr.pd_gain_scale)
 kin = Kinematics(robot, dev)
-motion = MotionLib.from_dir(args.motion_dir or robot.motion_dir, robot, kin, dev, args.motion_quat_order)
+motion = MotionLib.from_dir(args.motion_dir or robot.motion_dir, robot, kin, dev, args.motion_quat_order,
+                            cache_gib=args.motion_cache_gib)
 mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)
 C = len(motion.names)
 N = C * args.repeats
@@ -111,6 +116,7 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
     hist = None
     traj = {"root_p": [], "root_quat": [], "q": [], "f": [], "alive": []}
     while not bool(env.done_eval.all()):
+        motion.prepare(env.f, ahead=K+1, extra=env.init_f)
         S = env.state()
         o = env.observe()
         hist = o.unsqueeze(1).repeat(1, Hh, 1) if hist is None else torch.cat((hist[:, 1:], o.unsqueeze(1)), 1)

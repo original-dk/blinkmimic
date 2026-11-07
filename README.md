@@ -119,6 +119,76 @@ Python installation is used for training, evaluation and rendering:
 source .venv/bin/activate
 ```
 
+### Full BONES-SEED with 96 GB RAM and a 32 GB GPU
+
+Branch `perf/bones-seed-cpu-cache` starts from `reward/reset-relative-base`. Set `--motion_cache_gib`
+to keep the full FP32 reference library in system RAM and cache requested pages on the GPU. A value of
+0 retains the original fully resident GPU loader. Both training and the two evaluators accept this option.
+The CPU library includes the original root state, joint state, body FK and local reference velocities;
+commands, reward configuration and critic features use the original equations. No FP16 motion storage
+is used. All clips and time bins remain eligible for sampling, and replay stores full-library frame IDs.
+Evicted frames are reloaded when a later batch needs them; switching cache pages never clears replay.
+
+```bash
+PYTHON=python bash scripts/train_bones_cpu.sh logs/bones_cpu_s0 \
+  --motion_dir /path/to/bones --motion_quat_order wxyz \
+  --seed 0 --yaw_degrees 90 --xy_range 0 0.1
+```
+
+This sets a **6 GiB motion cache**, 4096 training worlds, 500 replay steps, batches of 2048, a 200-step
+episode limit, 100000 iterations and checkpoints every 1000 iterations. It retains the main optimizer,
+reward and learning-rate schedule. Extra flags override defaults. Probes remain enabled (15% reset focus),
+with at most 512 extra worlds, starting at iteration 1000 and repeating every 250 iterations (failure-count decay 0.5).
+Each sweep samples candidates from the full motion set. They run
+synchronously (`--eprobe_async 0`). Add `--eprobe_share 0` to disable them.
+
+For G1 with 14 tracked links, CPU reference storage is 1336 bytes/frame, plus 8 bytes/frame for calibrated
+foot contacts. At 51,888,186 frames this is about **65 GiB RAM**, plus metadata and bounded initialization
+temporaries. Files are resampled one at a time; FK is processed in batches of at most 65536 frames.
+Only the small transfer buffer is pinned. The GPU cache limit covers reference pages; global metadata
+(about 0.8 GiB for this dataset), contact pages, transfer buffers, simulation, replay and networks are extra.
+Startup prints reference RAM/device sizes; TensorBoard `memory/*` records cache hit fraction and whole-device use.
+
+Before collection, policy updates and probe sweeps, required reference pages are staged outside CUDA graphs.
+Policy batches are freshly sampled before each update and copied into fixed tensors for graph replay.
+Random resets also run outside the collection graph so their selected frames can be loaded; the cache mode
+turns off `--reset_masked` and prints this adjustment. GPU collection and update graphs remain enabled.
+This introduces CPU synchronization/PCIe transfers and can lower iteration throughput. A batch that cannot
+fit together raises a cache-capacity error; increase `--motion_cache_gib` or reduce batch/environment count.
+
+First run through graph capture, replay fill and resets using a separate smoke-test directory:
+
+```bash
+PYTHON=python bash scripts/train_bones_cpu.sh logs/bones_cpu_check \
+  --motion_dir /path/to/bones --motion_quat_order wxyz \
+  --iterations 300 --ckpt_every 300 --log_every 10 \
+  --eprobe_start 100 --eprobe_every 100
+```
+
+The smoke check starts probes earlier to exercise reference staging and graph replay during sweeps;
+use the normal start time for the actual training run.
+
+Random-start evaluation uses the same CPU/GPU mode and a bounded number of rollout worlds:
+
+```bash
+python -m blinkmimic.evaluateran --run_dir logs/bones_cpu_s0 \
+  --ckpt logs/bones_cpu_s0/ckpt_010000.pt \
+  --motion_dir /path/to/bones --motion_quat_order wxyz --motion_cache_gib 6 \
+  --episodes 20 --seed 0 --record logs/bones_cpu_s0/traj_ran.npz
+```
+
+Render this recording with the existing `tools/render_ran.py` workflow below. Reference recording reads
+the CPU master arrays directly. The original `evaluate` still creates a world per clip, so use `evaluateran`
+for this large library. CPU regression tests compare FP32 reference fields, commands, rewards, critic
+features and gradients with the original loader, including page replacement and replay reloads:
+
+```bash
+PYTHONPATH=src:tools python -m unittest test_motion_cache
+```
+
+CUDA-specific graph checks run when a GPU is available. This development workspace has no CUDA GPU
+or full BONES-SEED copy; full-library memory, runtime speed and learning quality require target-machine validation.
+
 ### 1. Train with relative reset rewards and random robot yaw/position
 
 ```bash

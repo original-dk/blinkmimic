@@ -57,6 +57,7 @@ def replay_diagnostics(buffer, wm, mdp, normalize_xi, err_floor, window: int, ho
     # Score only continuous transitions, with the exact reset metadata and next reference frame.
     valid = w["mask"].bool()
     f, init, init_f = w["f"][valid] + 1, w["init_root"][valid], w["init_f"][valid]
+    mdp.motion.prepare(f, extra=init_f)
     a, prev = w["a"][valid], w["a_prev"][valid]
     for source, states in (("sim", actual), ("model", predicted)):
         S = tuple(x[valid] for x in states)

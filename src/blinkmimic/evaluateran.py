@@ -75,6 +75,7 @@ def main():
     parser.add_argument("--ckpt", type=str, default=None, help="evaluate one checkpoint")
     parser.add_argument("--record", type=str, default=None, help="save trajectories (npz) for rendering")
     parser.add_argument("--motion_dir", type=str, default=None, help="defaults to the robot's motion directory")
+    parser.add_argument("--motion_cache_gib", type=float, default=0, help="FP32 CPU library with bounded GPU cache; 0 disables")
     parser.add_argument("--motion_quat_order", choices=["wxyz", "xyzw"], default="wxyz",
                         help="NPZ root quaternion order (default: wxyz); CSV keeps the robot's format")
     parser.add_argument("--every", type=int, default=1, help="evaluate every n-th checkpoint")
@@ -94,6 +95,8 @@ def main():
         parser.error("--xy_range requires finite LOW <= HIGH")
     if args.repeats < 1 or args.episodes < 1:
         parser.error("--episodes and --repeats must be positive")
+    if not math.isfinite(args.motion_cache_gib) or args.motion_cache_gib < 0:
+        parser.error("--motion_cache_gib must be finite and nonnegative")
 
     import dataclasses
     import re
@@ -142,11 +145,13 @@ def main():
         robot = transfer_dr(robot, robot if args.dr_from == "self" else get_robot(args.dr_from), args.dr_parts)
         print("pd_gain_scale on this robot:", robot.dr.pd_gain_scale)
     kin = Kinematics(robot, dev)
-    motion = MotionLib.from_dir(args.motion_dir or robot.motion_dir, robot, kin, dev, args.motion_quat_order)
+    motion = MotionLib.from_dir(args.motion_dir or robot.motion_dir, robot, kin, dev, args.motion_quat_order,
+                                cache_gib=args.motion_cache_gib)
     C = len(motion.names)
     mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)
     N = args.episodes * args.repeats
     clip_of, start_frames, yaw = sample_starts(motion, N, math.radians(args.yaw_degrees), args.seed)
+    motion.prepare(start_frames)
     pos_rng = torch.Generator(device=motion.root_p.device).manual_seed(args.seed + 1)
     pos_offset = sample_reset_xy(motion.root_p[start_frames], tuple(args.xy_range), pos_rng)
 
@@ -173,6 +178,7 @@ def main():
         hist = None
         traj = {"root_p": [], "root_quat": [], "q": [], "f": [], "alive": []}
         while not bool(env.done_eval.all()):
+            motion.prepare(env.f, ahead=K+1, extra=env.init_f)
             S = env.state()
             o = env.observe()
             hist = o.unsqueeze(1).repeat(1, Hh, 1) if hist is None else torch.cat((hist[:, 1:], o.unsqueeze(1)), 1)

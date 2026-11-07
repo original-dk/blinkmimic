@@ -29,6 +29,8 @@ def load_npz(path: str, quat_order: str = "wxyz") -> MotionArrays:
 
 
 class MotionLib:
+    cached = False
+
     def __init__(self, files: list[str], kin: Kinematics, device: str, load_motion: Callable[[str], MotionArrays],
                  quat_order: str = "wxyz"):
         self.device = device
@@ -100,14 +102,23 @@ class MotionLib:
             self.frame_bin[s:e] = b
 
     @staticmethod
-    def from_dir(path: str, robot: RobotSpec, kin: Kinematics, device: str, quat_order: str = "wxyz") -> MotionLib:
+    def from_dir(path: str, robot: RobotSpec, kin: Kinematics, device: str, quat_order: str = "wxyz",
+                 cache_gib: float = 0) -> MotionLib:
         files = sorted({f for pattern in (robot.motion_glob, "*.npz")
                         for f in glob.glob(os.path.join(path, "**", pattern), recursive=True)})
         if not files:
             raise FileNotFoundError(f"No motions matching {robot.motion_glob} or *.npz in {path}")
-        motion = MotionLib(files, kin, device, robot.load_motion, quat_order)
+        cls = MotionLib
+        if cache_gib:
+            from .motion_cache import CachedMotionLib
+            cls = CachedMotionLib
+        kwargs = {"cache_gib": cache_gib} if cache_gib else {}
+        motion = cls(files, kin, device, robot.load_motion, quat_order, **kwargs)
         motion.names = [os.path.splitext(os.path.relpath(f, path))[0] for f in files]
         return motion
+
+    def prepare(self, frames, ahead: int = 0, extra=None):
+        """Stage reference frames before GPU work; the fully resident library needs no copies."""
 
     def set_ref_contact(self, feet: list[int], margin: float = 0.015, vmax: float = 0.5, q: float = 0.05) -> None:
         """Speed-branch reference foot contact (num_frames, len(feet)): height below the clip's own floor (the

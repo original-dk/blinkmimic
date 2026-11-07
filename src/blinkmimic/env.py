@@ -231,6 +231,7 @@ class TrackingSim:
         bins = torch.multinomial(probs, n, replacement=True)
         start = m.bin_start[bins]
         end = torch.minimum(start + 50, m.clip_end[m.bin_clip[bins]])  # keep >= 1 step before the clip end
+        start = torch.minimum(start, end - 1)
         f = start + (torch.rand(n, device=self.device) * (end - start).float()).long()
         return f, bins
 
@@ -244,6 +245,7 @@ class TrackingSim:
         else:
             bins = self.motion.frame_bin[frames]
         m, c = self.motion, self.spec.dr
+        m.prepare(frames)
         p, R, v, w, q, qd = (x.clone() for x in m.ref_state(frames))
         if self.reset_noise:
             u = lambda half: torch.stack([torch.empty(n, device=dev).uniform_(-h, h) for h in half], -1)  # noqa: E731
