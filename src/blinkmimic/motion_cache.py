@@ -1,4 +1,4 @@
-"""Full FP32 references in host RAM, with a bounded, paged GPU working set.
+"""FP32 root/joint states on the host, with a bounded, paged GPU working set.
 
 Global frame IDs and the reset sampler cover the entire library. prepare() runs outside CUDA graphs;
 captured computation only indexes fixed device tensors through a page table. Replay keeps global IDs,
@@ -8,23 +8,29 @@ so evicting a reference never invalidates a recorded transition: it can be loade
 from __future__ import annotations
 
 import os
+import fcntl
+import hashlib
+import json
+from pathlib import Path
+import weakref
 
 import numpy as np
 import torch
 
 from .motion import BIN_FRAMES, CONTROL_DT, MotionLib, _gradient, load_npz
+from .motion_storage import GIB, MappedStates, check_memory
 from .rotations import quat_slerp, quat_to_mat, so3_log
 
 
 class CachedField:
     """Tensor-like frame indexing; only requested pages reside on the computation device."""
 
-    def __init__(self, owner, name, shape, offset):
+    def __init__(self, owner, name, shape, offset, host=True):
         self.owner, self.name = owner, name
         self.shape = (owner.num_frames, *shape)
         self.device, self.dtype = owner.device, torch.float32
         width = int(np.prod(shape))
-        self.host = owner.host[:, offset:offset+width].view(owner.num_frames, *shape)
+        self.host = owner.host[:, offset:offset+width].view(owner.num_frames, *shape) if host else None
         self.data = owner.data[:, offset:offset+width].view(-1, *shape)
 
     def __getitem__(self, frames):
@@ -33,6 +39,8 @@ class CachedField:
         return self.data[rows]
 
     def cpu(self):
+        if self.host is None:
+            raise RuntimeError(f"{self.name} is cached on the GPU; query prepared frame IDs")
         return self.host
 
 
@@ -40,19 +48,53 @@ class CachedMotionLib(MotionLib):
     cached = True
 
     @torch.no_grad()
-    def __init__(self, files, kin, device, load_motion, quat_order="wxyz", cache_gib=6, page_size=64):
+    def __init__(self, files, kin, device, load_motion, quat_order="wxyz", cache_gib=6, page_size=64, cache_dir=None):
         self.device, self.page_size = torch.device(device), page_size
+        self.kin, self.storage = kin, None
         self.names = [os.path.splitext(os.path.basename(f))[0] for f in files]
         read = lambda f: load_npz(f, quat_order) if f.endswith(".npz") else load_motion(f)
-        lengths = []
-        for path in files:
-            p, quat, j, fps = read(path)
-            if len(p) < 2 or not np.isfinite(fps) or fps <= 0:
-                raise ValueError(f"Motion needs two frames and a positive finite fps: {path}")
-            lengths.append(int(np.floor((len(p)-1) / fps / CONTROL_DT)) + 1)
+        manifest, saved = None, None
+        if cache_dir is not None:
+            key = hashlib.sha256(f"fp32-root-v1:{quat_order}".encode())
+            for path in files:
+                stat = os.stat(path)
+                key.update(f"{os.path.realpath(path)}:{stat.st_size}:{stat.st_mtime_ns}\n".encode())
+            folder = Path(cache_dir).resolve()/key.hexdigest()[:24]
+            folder.mkdir(parents=True, exist_ok=True)
+            manifest = folder/'complete.json'
+            self._lock = (folder/'lock').open('a+b')
+            weakref.finalize(self, self._lock.close)
+            ready = manifest.exists()
+            try:
+                fcntl.flock(self._lock, (fcntl.LOCK_SH if ready else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError(f"Motion cache is being built by another process: {folder}") from None
+            if ready:
+                saved = json.loads(manifest.read_text())
+        if saved is not None:
+            lengths, self.num_j = saved['lengths'], saved['num_j']
+        else:
+            lengths = []
+            for i, path in enumerate(files):
+                p, quat, j, fps = read(path)
+                if len(p) < 2 or not np.isfinite(fps) or fps <= 0:
+                    raise ValueError(f"Motion needs two frames and a positive finite fps: {path}")
+                lengths.append(int(np.floor((len(p)-1) / fps / CONTROL_DT)) + 1)
+                if (i+1) % 10000 == 0:
+                    print(f"motion scan: {i+1}/{len(files)} clips", flush=True)
+            self.num_j = j.shape[-1] if lengths else 0
         if not lengths or min(lengths) < 2:
             raise ValueError("Motion library needs at least two resampled frames per clip")
-        self.num_frames, self.num_j = sum(lengths), j.shape[-1]
+        self.num_frames = sum(lengths)
+        raw_width = 18 + 2*self.num_j
+        available = check_memory(self.num_frames, raw_width, mapped=manifest is not None)
+        if manifest is not None:
+            self.storage = MappedStates(folder/'states.fp32', self.num_frames, raw_width, create=saved is None)
+            self.host = self.storage.tensor
+        else:
+            self.host = torch.empty(self.num_frames, raw_width, dtype=torch.float32)
+        print(f"motion host: FP32 root/joints {self.num_frames*raw_width*4/GIB:.2f} GiB "
+              f"({'SSD mapping' if self.storage else 'RAM'}), available RAM/cgroup {available/GIB:.2f} GiB", flush=True)
         self.clip_len = torch.tensor(lengths, device=device)
         starts = np.concatenate(([0], np.cumsum(np.asarray(lengths, dtype=np.int64)[:-1])))
         self.clip_start = torch.tensor(starts, device=device)
@@ -74,9 +116,8 @@ class CachedMotionLib(MotionLib):
         shapes = dict(root_p=(3,), root_R=(3, 3), root_v=(3,), root_w=(3,), q=(J,), qd=(J,),
                       body_p=(L, 3), body_R=(L, 3, 3), body_v=(L, 3), body_w=(L, 3),
                       root_v_local=(3,), root_w_local=(3,))
-        # One final host allocation; resampling and FK temporaries are bounded, not whole-library lists.
+        # Derived body references live only in the GPU cache, never in a full-library CPU allocation.
         width = sum(int(np.prod(s)) for s in shapes.values())
-        self.host = torch.empty(self.num_frames, width, dtype=torch.float32)
         self.num_pages = (self.num_frames + page_size - 1) // page_size
         self.capacity = min(self.num_pages, int(cache_gib * 2**30) // (page_size * width * 4))
         if self.capacity < 1:
@@ -90,11 +131,11 @@ class CachedMotionLib(MotionLib):
         self.clock, self.loaded_pages, self.requested_pages = 0, 0, 0
         offset = 0
         for name, shape in shapes.items():
-            setattr(self, name, CachedField(self, name, shape, offset))
+            setattr(self, name, CachedField(self, name, shape, offset, host=offset < raw_width))
             offset += int(np.prod(shape))
         # root_gz aliases the root rotation exactly, as in the resident library.
         self.root_gz = CachedField(self, "root_gz", (), 3+8)
-        for path, start, n in zip(files, starts, lengths):
+        for path, start, n in ([] if saved is not None else zip(files, starts, lengths)):
             p, quat, j, fps = read(path)
             p, quat, j = (torch.tensor(x, dtype=torch.float32) for x in (p, quat, j))
             t = torch.arange(n, dtype=torch.float32) * CONTROL_DT * fps
@@ -111,18 +152,25 @@ class CachedMotionLib(MotionLib):
                 if not torch.isfinite(value).all():
                     raise ValueError(f"Non-finite motion data: {path}")
                 getattr(self, name).host[start:start+n].copy_(value)
-        for s in range(0, self.num_frames, 65536):
-            e = min(s+65536, self.num_frames)
-            state = tuple(getattr(self, k).host[s:e].to(device) for k in ("root_p", "root_R", "root_v", "root_w", "q", "qd"))
-            for name, value in zip(("body_p", "body_R", "body_v", "body_w"), kin.forward(*state)):
-                getattr(self, name).host[s:e].copy_(value.cpu())
-            Rt = state[1].transpose(-1, -2)
-            self.root_v_local.host[s:e].copy_((Rt @ state[2].unsqueeze(-1)).squeeze(-1).cpu())
-            self.root_w_local.host[s:e].copy_((Rt @ state[3].unsqueeze(-1)).squeeze(-1).cpu())
-        # Pin only a small transfer buffer, not ~65 GiB of reference RAM.
+            if self.storage is not None:
+                self.storage.release(written=True, nbytes=n*raw_width*4)
+            if (self.clip_start.numel() > 10000) and int(start+n) // 1_000_000 != int(start) // 1_000_000:
+                print(f"motion preprocess: {start+n:,}/{self.num_frames:,} frames", flush=True)
+        if self.storage is not None:
+            self.storage.release(written=saved is None, force=True)
+            if saved is None:
+                temporary = manifest.with_suffix('.tmp')
+                temporary.write_text(json.dumps(dict(lengths=lengths, num_j=self.num_j)))
+                os.replace(temporary, manifest)
+                fcntl.flock(self._lock, fcntl.LOCK_SH)
+        # Pin only a small transfer buffer. Full body data are computed once per missing cache page.
         batch = min(self.capacity, 256) * page_size
-        self.staging = torch.empty(batch, width, pin_memory=self.device.type == "cuda")
-        self.transfer = torch.empty(batch, width, device=device)
+        self.staging = torch.empty(batch, raw_width, pin_memory=self.device.type == "cuda")
+        self.transfer = torch.empty(batch, raw_width, device=device)
+
+    def host_state(self, begin, end):
+        return tuple(getattr(self, k).host[begin:end].to(self.device)
+                     for k in ("root_p", "root_R", "root_v", "root_w", "q", "qd"))
 
     @property
     def host_bytes(self):
@@ -137,7 +185,7 @@ class CachedMotionLib(MotionLib):
 
     @torch.no_grad()
     def prepare(self, frames, ahead: int = 0, extra=None):
-        """Make the entire request resident at once. No sampling, quantization or FK occurs here."""
+        """Stage raw FP32 state and compute derived fields only for missing pages, outside graphs."""
         f = frames.detach().reshape(-1).cpu().numpy()
         if ahead < 0 or (len(f) and (f.min() < 0 or f.max() >= self.num_frames)):
             raise ValueError("Invalid motion prefetch range")
@@ -175,12 +223,21 @@ class CachedMotionLib(MotionLib):
             n = len(src)
             torch.index_select(self.host, 0, torch.from_numpy(src.clip(max=self.num_frames-1)), out=self.staging[:n])
             self.transfer[:n].copy_(self.staging[:n], non_blocking=True)
-            self.data.index_copy_(0, torch.from_numpy(dst).to(self.device), self.transfer[:n])
+            rows = torch.from_numpy(dst).to(self.device)
+            self.data[:, :self.host.shape[1]].index_copy_(0, rows, self.transfer[:n])
+            state = tuple(getattr(self, k).data[rows] for k in ("root_p", "root_R", "root_v", "root_w", "q", "qd"))
+            for name, value in zip(("body_p", "body_R", "body_v", "body_w"), self.kin.forward(*state)):
+                getattr(self, name).data.index_copy_(0, rows, value)
+            Rt = state[1].transpose(-1, -2)
+            self.root_v_local.data.index_copy_(0, rows, (Rt @ state[2].unsqueeze(-1)).squeeze(-1))
+            self.root_w_local.data.index_copy_(0, rows, (Rt @ state[3].unsqueeze(-1)).squeeze(-1))
             if hasattr(self, "ref_contact"):
                 self.ref_contact.data.index_copy_(0, torch.from_numpy(dst).to(self.device),
                                                  self.ref_contact.host[src.clip(max=self.num_frames-1)].to(self.device))
             if self.device.type == "cuda":
                 torch.cuda.current_stream(self.device).synchronize()  # staging may now be safely overwritten
+            if self.storage is not None:
+                self.storage.release(nbytes=n*self.host.shape[1]*4)
         self.page_table[torch.from_numpy(missing).to(self.device)] = torch.from_numpy(victims).to(self.device)
         self.stamps[self.slots[needed]] = self.clock
         self.loaded_pages += len(missing)
@@ -193,11 +250,19 @@ class CachedMotionLib(MotionLib):
         field.device, field.dtype, field.shape = self.device, torch.float32, (self.num_frames, len(feet))
         field.host = torch.empty(self.num_frames, len(feet))
         field.data = torch.empty(self.capacity*self.page_size, len(feet), device=self.device)
+        z = torch.empty(self.num_frames, len(feet))
+        speed = torch.empty_like(z)
+        for s in range(0, self.num_frames, 65536):
+            e = min(s+65536, self.num_frames)
+            body = self.kin.forward(*self.host_state(s, e))
+            z[s:e].copy_(body[0][:, feet, 2].cpu())
+            speed[s:e].copy_(body[2][:, feet, :2].norm(dim=-1).cpu())
+            if self.storage is not None:
+                self.storage.release(nbytes=(e-s)*self.host.shape[1]*4)
         starts, ends = self.clip_start.cpu().tolist(), self.clip_end.cpu().tolist()
         for s, e in zip(starts, ends):
-            z = self.body_p.host[s:e+1, feet, 2]
-            speed = self.body_v.host[s:e+1, feet, :2].norm(dim=-1)
-            field.host[s:e+1] = ((z < z.quantile(q, dim=0)+margin) & (speed < vmax)).float()
+            height, velocity = z[s:e+1], speed[s:e+1]
+            field.host[s:e+1] = ((height < height.quantile(q, dim=0)+margin) & (velocity < vmax)).float()
         self.ref_contact = field
         self.slots.fill(-1)
         self.pages.fill(-1)

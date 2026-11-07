@@ -122,16 +122,18 @@ source .venv/bin/activate
 ### Full BONES-SEED with 96 GB RAM and a 32 GB GPU
 
 Branch `perf/bones-seed-cpu-cache` starts from `reward/reset-relative-base`. Set `--motion_cache_gib`
-to keep the full FP32 reference library in system RAM and cache requested pages on the GPU. A value of
-0 retains the original fully resident GPU loader. Both training and the two evaluators accept this option.
-The CPU library includes the original root state, joint state, body FK and local reference velocities;
-commands, reward configuration and critic features use the original equations. No FP16 motion storage
-is used. All clips and time bins remain eligible for sampling, and replay stores full-library frame IDs.
-Evicted frames are reloaded when a later batch needs them; switching cache pages never clears replay.
+to cache requested FP32 reference pages on the GPU. The host library stores only root/joint states in an
+SSD-backed mapping; body FK and local velocities are computed on cache misses and retained in the GPU
+cache. There is no full-library body allocation in RAM. A value of 0 retains the original fully resident
+GPU loader. Both training and the two evaluators accept this option. Commands, reward configuration and
+critic features use the original equations, without FP16 motion storage. All clips/time bins remain
+eligible for sampling, and replay stores full-library frame IDs. Evicted frames are reloaded when needed;
+switching cache pages never clears replay.
 
 ```bash
 PYTHON=python bash scripts/train_bones_cpu.sh logs/bones_cpu_s0 \
   --motion_dir /path/to/bones --motion_quat_order wxyz \
+  --motion_cache_dir /path/on/local_ssd/bones_cache \
   --seed 0 --yaw_degrees 90 --xy_range 0 0.1
 ```
 
@@ -142,12 +144,21 @@ with at most 512 extra worlds, starting at iteration 1000 and repeating every 25
 Each sweep samples candidates from the full motion set. They run
 synchronously (`--eprobe_async 0`). Add `--eprobe_share 0` to disable them.
 
-For G1 with 14 tracked links, CPU reference storage is 1336 bytes/frame, plus 8 bytes/frame for calibrated
-foot contacts. At 51,888,186 frames this is about **65 GiB RAM**, plus metadata and bounded initialization
-temporaries. Files are resampled one at a time; FK is processed in batches of at most 65536 frames.
-Only the small transfer buffer is pinned. The GPU cache limit covers reference pages; global metadata
-(about 0.8 GiB for this dataset), contact pages, transfer buffers, simulation, replay and networks are extra.
-Startup prints reference RAM/device sizes; TensorBoard `memory/*` records cache hit fraction and whole-device use.
+For G1, root/joint storage is **304 bytes/frame**, so 51,888,186 frames use a **14.69 GiB mapped file**.
+This is backing-file size, not a required resident RAM allocation. Keep at least 20 GiB free on a local SSD.
+`--motion_cache_dir` defaults to `<log_dir>/motion_cache` (evaluation: `<run_dir>/motion_cache`); explicitly
+use the same directory across runs to reuse completed states. Input paths, sizes, modification times and
+quaternion order identify the cache. An interrupted build is rebuilt; concurrent builders cannot overwrite it.
+RAM filesystems such as `/dev/shm`/tmpfs are rejected, and insufficient disk space is checked before allocation.
+
+Resampling proceeds one clip at a time. Initialization flushes completed mapped pages and drops them from
+the process working set in roughly 64 MiB increments. Startup also checks available RAM and finite cgroup
+limits, leaving an OS reserve; this catches a container limit even if the machine has 96 GB installed.
+Calibrated foot contacts add about 0.39 GiB RAM and bounded preprocessing temporaries (about 0.77 GiB for
+the two full-library foot scalars). Only the small transfer buffer is pinned. The GPU cache limit covers
+reference pages; global metadata (about 0.8 GiB), contact pages, transfer buffers, simulation, replay and
+networks are extra. TensorBoard `memory/motion_host_gib` reports logical host backing size, not process RSS;
+other `memory/*` tags include cache hit fraction and whole-device use.
 
 Before collection, policy updates and probe sweeps, required reference pages are staged outside CUDA graphs.
 Policy batches are freshly sampled before each update and copied into fixed tensors for graph replay.
@@ -161,6 +172,7 @@ First run through graph capture, replay fill and resets using a separate smoke-t
 ```bash
 PYTHON=python bash scripts/train_bones_cpu.sh logs/bones_cpu_check \
   --motion_dir /path/to/bones --motion_quat_order wxyz \
+  --motion_cache_dir /path/on/local_ssd/bones_cache \
   --iterations 300 --ckpt_every 300 --log_every 10 \
   --eprobe_start 100 --eprobe_every 100
 ```
@@ -174,13 +186,15 @@ Random-start evaluation uses the same CPU/GPU mode and a bounded number of rollo
 python -m blinkmimic.evaluateran --run_dir logs/bones_cpu_s0 \
   --ckpt logs/bones_cpu_s0/ckpt_010000.pt \
   --motion_dir /path/to/bones --motion_quat_order wxyz --motion_cache_gib 6 \
+  --motion_cache_dir /path/on/local_ssd/bones_cache \
   --episodes 20 --seed 0 --record logs/bones_cpu_s0/traj_ran.npz
 ```
 
 Render this recording with the existing `tools/render_ran.py` workflow below. Reference recording reads
-the CPU master arrays directly. The original `evaluate` still creates a world per clip, so use `evaluateran`
+the mapped root/joint arrays directly. The original `evaluate` still creates a world per clip, so use `evaluateran`
 for this large library. CPU regression tests compare FP32 reference fields, commands, rewards, critic
-features and gradients with the original loader, including page replacement and replay reloads:
+features and gradients with the original loader, including page replacement, replay reloads, mapped-file
+reuse/rebuild and low RAM/disk/cgroup rejection:
 
 ```bash
 PYTHONPATH=src:tools python -m unittest test_motion_cache

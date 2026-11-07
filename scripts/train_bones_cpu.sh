@@ -1,5 +1,5 @@
 #!/bin/bash
-# Full FP32 reference library in RAM; a bounded GPU cache serves the unchanged reward/command heads.
+# FP32 SSD-mapped root/joint states; body references are computed on GPU cache misses.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 LOG_DIR=${1:?usage: bash scripts/train_bones_cpu.sh <log_dir> --motion_dir <bones_dir> [train.py flags]}; shift

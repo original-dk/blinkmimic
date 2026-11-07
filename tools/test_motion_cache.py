@@ -12,7 +12,7 @@ import subprocess
 import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
@@ -24,6 +24,7 @@ from blinkmimic.mdp import MDP, flatten_state
 from blinkmimic.mdp import MAX_STEP_REWARD, unflatten_state
 from blinkmimic.motion import MotionLib
 from blinkmimic.motion_cache import CachedMotionLib
+from blinkmimic.motion_storage import GIB, MappedStates, check_disk, check_memory, memory_budget
 from blinkmimic.networks import Critic, Policy, WorldModel
 from blinkmimic.objective import actor_objective
 from blinkmimic.rotations import mat_to_quat, so3_exp
@@ -81,6 +82,99 @@ class MotionCacheTest(unittest.TestCase):
         before = self.cache.loaded_pages
         self.cache.prepare(torch.tensor([2, 54]), ahead=4)
         self.assertEqual(self.cache.loaded_pages, before)
+
+    def test_only_raw_fp32_state_is_stored_on_the_host(self):
+        self.assertEqual(self.cache.host.shape, (88, 18+2*3))
+        self.assertEqual(self.cache.host_bytes, 88*(18+2*3)*4)
+        for name in ('body_p', 'body_R', 'body_v', 'body_w', 'root_v_local', 'root_w_local'):
+            self.assertIsNone(getattr(self.cache, name).host)
+        self.kin.forward = Mock(wraps=self.kin.forward)
+        self.cache.prepare(torch.tensor([2, 54]))
+        calls = self.kin.forward.call_count
+        self.assertGreater(calls, 0)
+        self.cache.prepare(torch.tensor([2, 54]))
+        self.assertEqual(self.kin.forward.call_count, calls)
+
+    def test_ssd_mapping_reuses_completed_states_without_reloading_sources(self):
+        directory = self.root/'ssd-cache'
+        a = CachedMotionLib(self.files, self.kin, 'cpu', load_lafan1_csv, cache_gib=.001, cache_dir=directory)
+        self.assertIsInstance(a.storage, MappedStates)
+        self.assertEqual(a.storage.path.stat().st_size, a.num_frames*(18+2*3)*4)
+        with patch('blinkmimic.motion_cache.load_npz', side_effect=AssertionError('reloading completed cache')):
+            b = CachedMotionLib(self.files, self.kin, 'cpu', load_lafan1_csv, cache_gib=.001, cache_dir=directory)
+        f = torch.tensor([2, 54])
+        b.prepare(f, ahead=3)
+        torch.testing.assert_close(b.goal(f, 3), self.dense.goal(f, 3), atol=0, rtol=0)
+        # Dropping mapped pages must preserve file contents and all derived-cache queries.
+        b.storage.release(force=True)
+        torch.testing.assert_close(b.root_p.cpu(), self.dense.root_p, atol=0, rtol=0)
+
+    def test_changed_source_does_not_reuse_stale_disk_states(self):
+        directory = self.root/'ssd-change'
+        a = CachedMotionLib(self.files, self.kin, 'cpu', load_lafan1_csv, cache_gib=.001, cache_dir=directory)
+        with np.load(self.files[0]) as d:
+            raw = d['qpos'].copy()
+        raw[:, 0] += 5
+        np.savez(self.files[0], qpos=raw, fps=np.float32(50))
+        b = CachedMotionLib(self.files, self.kin, 'cpu', load_lafan1_csv, cache_gib=.001, cache_dir=directory)
+        self.assertNotEqual(a.storage.path, b.storage.path)
+        torch.testing.assert_close(b.root_p.cpu()[0], a.root_p.cpu()[0]+torch.tensor([5., 0., 0.]), atol=1e-6, rtol=0)
+
+    def test_interrupted_build_restarts_and_active_builder_is_not_overwritten(self):
+        import fcntl
+        directory = self.root/'ssd-incomplete'
+        a = CachedMotionLib(self.files, self.kin, 'cpu', load_lafan1_csv, cache_gib=.001, cache_dir=directory)
+        marker = a.storage.path.parent/'complete.json'
+        marker.unlink()
+        fcntl.flock(a._lock, fcntl.LOCK_EX)
+        with self.assertRaisesRegex(RuntimeError, 'being built'):
+            CachedMotionLib(self.files, self.kin, 'cpu', load_lafan1_csv, cache_gib=.001, cache_dir=directory)
+        a._lock.close()  # simulate release of the crashed builder's lock
+        b = CachedMotionLib(self.files, self.kin, 'cpu', load_lafan1_csv, cache_gib=.001, cache_dir=directory)
+        self.assertTrue(marker.exists())
+        torch.testing.assert_close(b.root_p.cpu(), self.dense.root_p, atol=0, rtol=0)
+
+    def test_cgroup_limit_and_ancestor_limits_override_machine_ram(self):
+        meminfo, cg, membership = self.root/'meminfo', self.root/'cgroup', self.root/'membership'
+        meminfo.write_text(f'MemTotal: {96*GIB//1024} kB\nMemAvailable: {80*GIB//1024} kB\n')
+        cg.mkdir()
+        (cg/'memory.max').write_text('max')
+        (cg/'memory.current').write_text('0')
+        child = cg/'user'/'worker'; child.mkdir(parents=True)
+        (child/'memory.max').write_text(str(16*GIB))
+        (child/'memory.current').write_text(str(14*GIB))
+        membership.write_text('0::/user/worker\n')
+        self.assertEqual(memory_budget(meminfo, cg, membership), (2*GIB, 16*GIB))
+        (cg/'user'/'memory.max').write_text(str(12*GIB))
+        (cg/'user'/'memory.current').write_text(str(11*GIB))
+        self.assertEqual(memory_budget(meminfo, cg, membership), (GIB, 12*GIB))
+
+    def test_insufficient_ram_exits_before_allocating_large_tensors(self):
+        class LargeMotion:
+            def __len__(self):
+                return 51_888_186
+        loader = lambda path: (LargeMotion(), None, np.zeros((1, 29)), 50.)
+        with patch('blinkmimic.motion_storage.memory_budget', return_value=(GIB, 96*GIB)):
+            with patch('blinkmimic.motion_cache.torch.empty', side_effect=AssertionError('allocated before preflight')):
+                with self.assertRaisesRegex(MemoryError, 'RAM/cgroup'):
+                    CachedMotionLib(['unused.csv'], self.kin, 'cpu', loader)
+
+    def test_insufficient_disk_and_ram_filesystems_are_rejected(self):
+        path = self.root/'ssd-full'/'states.fp32'
+        with patch('blinkmimic.motion_storage.shutil.disk_usage', return_value=SimpleNamespace(free=0)):
+            with self.assertRaisesRegex(OSError, 'free disk'):
+                MappedStates(path, 10, 24, create=True)
+        self.assertFalse(path.exists())
+        mounts = self.root/'mountinfo'
+        mounts.write_text(f'1 0 0:1 / / rw - ext4 /dev/root rw\n2 1 0:2 / {self.root} rw - tmpfs tmpfs rw\n')
+        with self.assertRaisesRegex(ValueError, 'RAM filesystem'):
+            check_disk(self.root/'ram-cache', 100, mountinfo=mounts)
+
+    def test_mapped_mode_does_not_require_full_reference_file_in_available_ram(self):
+        with patch('blinkmimic.motion_storage.memory_budget', return_value=(8*GIB, 16*GIB)):
+            check_memory(51_888_186, 76, mapped=True)
+            with self.assertRaises(MemoryError):
+                check_memory(51_888_186, 76, mapped=False)
 
     def test_one_clip_keeps_integer_metadata_and_explicit_xyzw_order(self):
         path = self.root/'single_xyzw.npz'

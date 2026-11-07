@@ -103,7 +103,7 @@ class MotionLib:
 
     @staticmethod
     def from_dir(path: str, robot: RobotSpec, kin: Kinematics, device: str, quat_order: str = "wxyz",
-                 cache_gib: float = 0) -> MotionLib:
+                 cache_gib: float = 0, cache_dir: str | None = None) -> MotionLib:
         files = sorted({f for pattern in (robot.motion_glob, "*.npz")
                         for f in glob.glob(os.path.join(path, "**", pattern), recursive=True)})
         if not files:
@@ -112,7 +112,7 @@ class MotionLib:
         if cache_gib:
             from .motion_cache import CachedMotionLib
             cls = CachedMotionLib
-        kwargs = {"cache_gib": cache_gib} if cache_gib else {}
+        kwargs = {"cache_gib": cache_gib, "cache_dir": cache_dir} if cache_gib else {}
         motion = cls(files, kin, device, robot.load_motion, quat_order, **kwargs)
         motion.names = [os.path.splitext(os.path.relpath(f, path))[0] for f in files]
         return motion

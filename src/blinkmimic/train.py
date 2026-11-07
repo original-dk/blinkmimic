@@ -128,6 +128,8 @@ parser.add_argument("--log_every", type=int, default=50)
 parser.add_argument("--motion_dir", type=str, default=None, help="defaults to the robot's motion directory")
 parser.add_argument("--motion_cache_gib", type=float, default=0,
                     help="FP32 CPU motion library with this many GiB of GPU frame cache (0: fully GPU resident)")
+parser.add_argument("--motion_cache_dir", type=str, default=None,
+                    help="FP32 SSD state cache (default: <log_dir>/motion_cache); requires motion_cache_gib > 0")
 parser.add_argument("--motion_quat_order", choices=["wxyz", "xyzw"], default="wxyz",
                     help="NPZ root quaternion order (default: wxyz); CSV keeps the robot's format")
 parser.add_argument("--log_dir", type=str, default=os.path.join(REPO, "logs", "run"))
@@ -193,9 +195,10 @@ if args.yaw_degrees is not None or args.xy_range is not None:
 J = robot.num_joints
 kin = Kinematics(robot, dev)
 motion = MotionLib.from_dir(args.motion_dir or robot.motion_dir, robot, kin, dev, args.motion_quat_order,
-                            cache_gib=args.motion_cache_gib)
+                            cache_gib=args.motion_cache_gib,
+                            cache_dir=args.motion_cache_dir or os.path.join(args.log_dir, 'motion_cache'))
 if motion.cached:
-    print(f"motion: {len(motion.names)} clips, {motion.num_frames:,} frames; FP32 host {motion.host_bytes / 2**30:.2f} GiB, "
+    print(f"motion: {len(motion.names)} clips, {motion.num_frames:,} frames; FP32 host backing {motion.host_bytes / 2**30:.2f} GiB, "
           f"GPU cache + metadata {motion.device_bytes / 2**30:.2f} GiB", flush=True)
 layout = XiLayout(robot, dev)
 normalize_xi = layout.normalize

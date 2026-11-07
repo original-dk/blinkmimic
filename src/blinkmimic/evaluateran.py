@@ -76,6 +76,7 @@ def main():
     parser.add_argument("--record", type=str, default=None, help="save trajectories (npz) for rendering")
     parser.add_argument("--motion_dir", type=str, default=None, help="defaults to the robot's motion directory")
     parser.add_argument("--motion_cache_gib", type=float, default=0, help="FP32 CPU library with bounded GPU cache; 0 disables")
+    parser.add_argument("--motion_cache_dir", type=str, default=None, help="FP32 SSD cache (default: <run_dir>/motion_cache)")
     parser.add_argument("--motion_quat_order", choices=["wxyz", "xyzw"], default="wxyz",
                         help="NPZ root quaternion order (default: wxyz); CSV keeps the robot's format")
     parser.add_argument("--every", type=int, default=1, help="evaluate every n-th checkpoint")
@@ -146,7 +147,8 @@ def main():
         print("pd_gain_scale on this robot:", robot.dr.pd_gain_scale)
     kin = Kinematics(robot, dev)
     motion = MotionLib.from_dir(args.motion_dir or robot.motion_dir, robot, kin, dev, args.motion_quat_order,
-                                cache_gib=args.motion_cache_gib)
+                                cache_gib=args.motion_cache_gib,
+                                cache_dir=args.motion_cache_dir or os.path.join(args.run_dir, 'motion_cache'))
     C = len(motion.names)
     mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)
     N = args.episodes * args.repeats
