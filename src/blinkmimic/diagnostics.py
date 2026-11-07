@@ -85,7 +85,8 @@ def replay_diagnostics(buffer, wm, mdp, normalize_xi, err_floor, window: int, ho
         local_v = mv3(S[1].transpose(-1, -2), S[2])
         values[f"motion_{source}/base_forward_speed"] = local_v[:, 0].mean()
         if source == "sim":
-            ref_v = mv3(mdp.motion.root_R[f].transpose(-1, -2), mdp.motion.root_v[f])
+            _, ref_R, ref_v, _, _, _ = mdp.motion.ref_state(f)
+            ref_v = mv3(ref_R.transpose(-1, -2), ref_v)
             values["motion_reference/base_forward_speed"] = ref_v[:, 0].mean()
     values["wm/reward_gap_without_contact"] = (values["reward_model/total"] - values["reward_model/contact"]
                                               - values["reward_sim/total"])

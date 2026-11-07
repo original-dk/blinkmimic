@@ -231,6 +231,7 @@ class TrackingSim:
         bins = torch.multinomial(probs, n, replacement=True)
         start = m.bin_start[bins]
         end = torch.minimum(start + 50, m.clip_end[m.bin_clip[bins]])  # keep >= 1 step before the clip end
+        start = torch.minimum(start, end - 1)  # a terminal-only bin shares the last valid transition
         f = start + (torch.rand(n, device=self.device) * (end - start).float()).long()
         return f, bins
 
@@ -242,7 +243,7 @@ class TrackingSim:
         if frames is None:
             frames, bins = self.sample_frames(n)
         else:
-            bins = self.motion.frame_bin[frames]
+            bins = self.motion.bin_of(frames)
         m, c = self.motion, self.spec.dr
         p, R, v, w, q, qd = (x.clone() for x in m.ref_state(frames))
         if self.reset_noise:
@@ -304,7 +305,7 @@ class TrackingSim:
         if frames is None:
             frames, bins = self.sample_frames(N, gate=d.any())
         else:
-            bins = m.frame_bin[frames]
+            bins = m.bin_of(frames)
         p, R, v, w, q, qd = (x.clone() for x in m.ref_state(frames))
         if self.reset_noise:
             u = lambda half: torch.stack([torch.empty(N, device=dev).uniform_(-h, h) for h in half], -1)  # noqa: E731
@@ -363,7 +364,7 @@ class TrackingSim:
         G = self.ep_disc_ret + boot
         self.bin_G.copy_(_bin_ema_w(self.bin_G, self.start_bin, G, dw, 0.8))
         if self.fail_reset > 0:
-            fb = self.motion.frame_bin[f.clamp(max=self.motion.num_frames - 1)]
+            fb = self.motion.bin_of(f.clamp(max=self.motion.num_frames - 1))
             bf = torch.where(done.any(), self.bin_fail * 0.999, self.bin_fail)
             self.bin_fail.copy_(_bin_ema_w(bf, fb, term.float(), dw, 0.9))
         out["n_done"] = dw.sum()
@@ -454,7 +455,7 @@ class TrackingSim:
         f1 = f + 1
         r, terms = self.mdp.reward(S1, f1, a, a_prev, terms=True, init_root=init_root, init_f=init_f)
         term = self.mdp.termination(S1, f1)
-        clip_end = self.motion.clip_end[self.motion.clip_id[f]]
+        clip_end = self.motion.clip_end[self.motion.clip_of(f)]
         timeout = (f1 >= clip_end) | (ep_step + 1 >= self.max_episode_steps)
         done = term | timeout
         out = {
@@ -490,7 +491,7 @@ class TrackingSim:
                 self.bin_G.index_put_((b,), 0.8 * self.bin_G[b] + 0.2 * G)
             if self.fail_reset > 0:
                 # termination rate of the bin where each episode ended (decays toward 0 as bins are mastered)
-                fb = self.motion.frame_bin[f[ids].clamp(max=self.motion.num_frames - 1)]
+                fb = self.motion.bin_of(f[ids].clamp(max=self.motion.num_frames - 1))
                 self.bin_fail.mul_(0.999)  # bins no episode ends in any more fade out
                 if self.bin_fix:
                     self.bin_fail.copy_(_bin_ema(self.bin_fail, fb, term[ids].float(), 0.9))

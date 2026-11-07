@@ -86,14 +86,15 @@ def run(cks):
         t = out["terms"]
         bp, _, bv, _ = kin.forward(*S1)
         fz, fv = bp[:, FEET, 2], bv[:, FEET, :2].norm(dim=-1)
-        rz, rv = motion.body_p[f1][:, FEET, 2], motion.body_v[f1][:, FEET, :2].norm(dim=-1)
+        ref_body = motion.body_state(f1)
+        rz, rv = ref_body[0][:, FEET, 2], ref_body[2][:, FEET, :2].norm(dim=-1)
         c_sim, c_ref = fz < CONTACT_Z, rz < CONTACT_Z
         acc["n"] += alive
         acc["ret"] += alive * out["r"]
         acc["pos"] += alive * t["e_body_pos"]
         acc["ori"] += alive * t["e_body_ori"]
         acc["root"] += alive * t["e_root_pos"].sqrt()
-        acc["joint"] += alive * (S1[4] - motion.q[f1]).abs().mean(-1)
+        acc["joint"] += alive * (S1[4] - motion.ref_state(f1)[4]).abs().mean(-1)
         acc["slip"] += alive * (fv * c_sim).sum(-1)
         acc["slip_n"] += alive * c_sim.float().sum(-1)
         acc["ref_slip"] += alive * (rv * c_ref).sum(-1)

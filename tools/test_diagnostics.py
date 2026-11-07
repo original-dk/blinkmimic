@@ -35,6 +35,7 @@ class ReplayDiagnosticsTest(unittest.TestCase):
         q = torch.zeros(n, 1)
         self.motion = SimpleNamespace(root_p=p, root_R=R, root_v=v, root_w=w, q=q, qd=q,
                                       body_p=p[:, None], body_R=R[:, None], body_v=v[:, None], body_w=w[:, None])
+        self.motion.ref_state = lambda f: tuple(getattr(self.motion, k)[f] for k in ('root_p', 'root_R', 'root_v', 'root_w', 'q', 'qd'))
         self.mdp = MDP(RootKinematics(), self.motion, torch.zeros(1), 1)
         self.mdp.feet = [0]
         self.wm = WorldModel(1, 1, hidden=(8,))

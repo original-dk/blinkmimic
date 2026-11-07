@@ -102,7 +102,7 @@ class MDP:
         return o + (2 * torch.rand_like(o) - 1) * self.obs_noise
 
     # ---------------- reward / termination ----------------
-    def base_diff(self, S, f, init_root=None, init_f=None):
+    def base_diff(self, S, f, init_root=None, init_f=None, ref_state=None):
         """Reference base diffs: initial-frame displacement/rotation, current-base local velocities.
 
         ``init_root`` is robot xyz+wxyz after reset noise; ``init_f`` selects the expert frame before
@@ -113,12 +113,12 @@ class MDP:
         assert (init_root is None) == (init_f is None), "reset pose and expert frame must be supplied together"
         p, R, v, w = S[:4]
         m = self.motion
-        rp, rR = m.root_p[f], m.root_R[f]
+        rp, rR, rv, rw, _, _ = m.ref_state(f) if ref_state is None else ref_state
         if init_root is None:
             diff_pos, rel_R, ref_rel_R = rp - p, R, rR
         else:
             p0, R0 = init_root[..., :3], quat_to_mat(init_root[..., 3:7])
-            rp0, rR0 = m.root_p[init_f], m.root_R[init_f]
+            rp0, rR0 = m.ref_state(init_f)[:2]
             R0t, rR0t = R0.transpose(-1, -2), rR0.transpose(-1, -2)
             diff_pos = mv3(rR0t, rp - rp0) - mv3(R0t, p - p0)
             rel_R, ref_rel_R = mm3(R0t, R), mm3(rR0t, rR)
@@ -126,13 +126,13 @@ class MDP:
         sign = torch.where(q_err[..., :1] < 0, -1.0, 1.0)
         diff_rot = 2 * sign * q_err[..., 1:]
         Rt, rRt = R.transpose(-1, -2), rR.transpose(-1, -2)
-        diff_lv = mv3(rRt, m.root_v[f]) - mv3(Rt, v)
-        diff_av = mv3(rRt, m.root_w[f]) - mv3(Rt, w)
+        diff_lv = mv3(rRt, rv) - mv3(Rt, v)
+        diff_av = mv3(rRt, rw) - mv3(Rt, w)
         return diff_pos, diff_rot, diff_lv, diff_av
 
-    def hybrid_root(self, R, f):
+    def hybrid_root(self, R, f, ref_R=None):
         """Robot's current yaw with the reference's current roll/pitch; not a reset-frame transform."""
-        rR = self.motion.root_R[f]
+        rR = self.motion.ref_state(f)[1] if ref_R is None else ref_R
 
         def heading(A):
             x, y = A[..., 0, 0], A[..., 1, 0]
@@ -146,7 +146,7 @@ class MDP:
         Y = torch.stack((c, -s, z, s, c, z, z, z, one), -1).reshape(R.shape)
         return mm3(Y, rR)
 
-    def body_diff(self, S, f, body_state=None):
+    def body_diff(self, S, f, body_state=None, ref_state=None, ref_body_state=None):
         """Link diffs in reference-root / hybrid-root frames, with rotation as a shortest-path 3D rotvec.
 
         Subtract each own root for positions. Velocities are full link world velocities rotated into
@@ -156,14 +156,16 @@ class MDP:
         p, R = S[:2]
         bp, bR, bv, bw = self.kin.forward(*S) if body_state is None else body_state
         m = self.motion
-        rp, rR = m.root_p[f], m.root_R[f]
+        ref = m.ref_state(f) if ref_state is None else ref_state
+        rp, rR = ref[:2]
+        rbp, rbR, rbv, rbw = self.kin.forward(*ref) if ref_body_state is None else ref_body_state
         rRt = rR.transpose(-1, -2).unsqueeze(-3)
-        Ht = self.hybrid_root(R, f).transpose(-1, -2).unsqueeze(-3)
-        diff_pos = mv3(rRt, m.body_p[f] - rp.unsqueeze(-2)) - mv3(Ht, bp - p.unsqueeze(-2))
-        ref_local_R, local_R = mm3(rRt, m.body_R[f]), mm3(Ht, bR)
+        Ht = self.hybrid_root(R, f, rR).transpose(-1, -2).unsqueeze(-3)
+        diff_pos = mv3(rRt, rbp - rp.unsqueeze(-2)) - mv3(Ht, bp - p.unsqueeze(-2))
+        ref_local_R, local_R = mm3(rRt, rbR), mm3(Ht, bR)
         diff_rot = so3_log(mm3(local_R.transpose(-1, -2), ref_local_R))
-        diff_lv = mv3(rRt, m.body_v[f]) - mv3(Ht, bv)
-        diff_av = mv3(rRt, m.body_w[f]) - mv3(Ht, bw)
+        diff_lv = mv3(rRt, rbv) - mv3(Ht, bv)
+        diff_av = mv3(rRt, rbw) - mv3(Ht, bw)
         return diff_pos, diff_rot, diff_lv, diff_av
 
     def reward(self, S, f, a, a_prev, terms: bool = False, w_contact: float = 0.0,
@@ -182,18 +184,20 @@ class MDP:
         p, R, v, w, q, qd = S
         body_state = self.kin.forward(p, R, v, w, q, qd)
         bp, bR, bv, bw = body_state
-        diff_pos, diff_rot, diff_lv, diff_av = self.body_diff(S, f, body_state)
+        ref = m.ref_state(f)
+        ref_body = self.kin.forward(*ref)
+        diff_pos, diff_rot, diff_lv, diff_av = self.body_diff(S, f, body_state, ref, ref_body)
         # Diagnostic errors are mean squared vector norms; rewards below use the configured sigma aggregations.
         e_pos = (diff_pos ** 2).sum(-1).mean(-1)
         e_ori = (diff_rot ** 2).sum(-1).mean(-1)
         e_lv = (diff_lv ** 2).sum(-1).mean(-1)
         e_av = (diff_av ** 2).sum(-1).mean(-1)
-        diff_rp, diff_ro, diff_rlv, diff_rav = self.base_diff(S, f, init_root, init_f)
+        diff_rp, diff_ro, diff_rlv, diff_rav = self.base_diff(S, f, init_root, init_f, ref)
         e_rp = (diff_rp ** 2).sum(-1)
         e_ro = (diff_ro ** 2).sum(-1)
         e_rlv = (diff_rlv ** 2).sum(-1)
         e_rav = (diff_rav ** 2).sum(-1)
-        e_jv = ((m.qd[f] - qd) ** 2).sum(-1)
+        e_jv = ((ref[5] - qd) ** 2).sum(-1)
         n_links = diff_pos.shape[-2]
         # Keep diagnostic errors as mean per-link vector norms. Reward sigma follows the reference
         # directly: pos/rot sum all link components; velocities average all components (including xyz).
@@ -217,10 +221,10 @@ class MDP:
                        joint_limit=c.w_joint_limit * r_lim, contact=torch.zeros_like(r_track))
         r = (r_track + c.w_action_rate * r_rate + c.w_action_magnitude * r_mag + c.w_joint_limit * r_lim) * CONTROL_DT
         if w_contact > 0:
-            fz, rz = bp[..., self.feet, 2], m.body_p[f][..., self.feet, 2]
+            fz, rz = bp[..., self.feet, 2], ref_body[0][..., self.feet, 2]
             c_sim = torch.sigmoid((CONTACT_Z - fz) / 0.005)
             rc = getattr(m, "ref_contact", None)  # MotionLib.set_ref_contact (--ref_contact_fix), else the fixed 4.5 cm
-            c_ref = rc[f] if rc is not None else (rz < CONTACT_Z).float()
+            c_ref = rc[f].float() if rc is not None else (rz < CONTACT_Z).float()
             slip = (bv[..., self.feet, :2] ** 2).sum(-1)
             r_contact = (1 - (c_sim - c_ref) ** 2) + c_ref * torch.exp(-slip / 0.3**2)
             rewards["contact"] = w_contact * r_contact.mean(-1)
@@ -247,7 +251,7 @@ class MDP:
 
     def termination(self, S, f) -> torch.Tensor:
         p, R = S[0], S[1]
-        rp, rR = self.motion.root_p[f], self.motion.root_R[f]
+        rp, rR = self.motion.ref_state(f)[:2]
         e_z = (rp[..., 2] - p[..., 2]).abs()
         e_tilt = (rR[..., 2, 2] - R[..., 2, 2]).abs()
         return (e_z > self.cfg.term_height) | (e_tilt > self.cfg.term_tilt)
@@ -255,7 +259,7 @@ class MDP:
     def soft_termination(self, S, f, tz: float = 0.02, tt: float = 0.04) -> torch.Tensor:
         """Differentiable termination probability for imagined rollouts."""
         p, R = S[0], S[1]
-        rp, rR = self.motion.root_p[f], self.motion.root_R[f]
+        rp, rR = self.motion.ref_state(f)[:2]
         e_z = (rp[..., 2] - p[..., 2]).abs()
         e_tilt = (rR[..., 2, 2] - R[..., 2, 2]).abs()
         alive = (1 - torch.sigmoid((e_z - self.cfg.term_height) / tz)) * (1 - torch.sigmoid((e_tilt - self.cfg.term_tilt) / tt))
@@ -270,6 +274,7 @@ class MDP:
         """
         assert init_root is not None and init_f is not None, "critic needs each sample's reset pose and expert frame"
         q, qd = S[4:]
-        body = tuple(x.flatten(-2) for x in self.body_diff(S, f))
-        base = self.base_diff(S, f, init_root, init_f)
-        return torch.cat((q, qd, self.motion.q[f] - q, *body, *base, xi), -1)
+        ref = self.motion.ref_state(f)
+        body = tuple(x.flatten(-2) for x in self.body_diff(S, f, ref_state=ref))
+        base = self.base_diff(S, f, init_root, init_f, ref)
+        return torch.cat((q, qd, ref[4] - q, *body, *base, xi), -1)

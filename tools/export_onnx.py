@@ -42,13 +42,15 @@ class PolicyWithMotion(nn.Module):
         super().__init__()
         self.pi = pi
         f = torch.arange(motion.num_frames)
+        S = motion.ref_state(f)
+        bp, bR, bv, bw = motion.body_state(f)
         self.register_buffer("goal", motion.goal(f, K))
-        self.register_buffer("q", motion.q)
-        self.register_buffer("qd", motion.qd)
-        self.register_buffer("body_p", motion.body_p)
-        self.register_buffer("body_quat", mat_to_quat(motion.body_R))
-        self.register_buffer("body_v", motion.body_v)
-        self.register_buffer("body_w", motion.body_w)
+        self.register_buffer("q", S[4])
+        self.register_buffer("qd", S[5])
+        self.register_buffer("body_p", bp)
+        self.register_buffer("body_quat", mat_to_quat(bR))
+        self.register_buffer("body_v", bv)
+        self.register_buffer("body_w", bw)
         self.last = motion.num_frames - 1
 
     def forward(self, obs_history: torch.Tensor, time_step: torch.Tensor):

@@ -55,10 +55,15 @@ class MotionNpzTest(unittest.TestCase):
         for order in ('wxyz', 'xyzw'):
             path = self.write(order+'.npz', order)
             motion = MotionLib([path], self.kin, 'cpu', load_lafan1_csv, order)
-            for attr in ('root_p', 'root_R', 'root_v', 'root_w', 'q', 'qd', 'body_p', 'body_R', 'body_v', 'body_w',
-                         'clip_start', 'clip_end', 'clip_id', 'frame_bin'):
+            for attr in ('root_p', 'rest', 'clip_start', 'clip_end'):
                 torch.testing.assert_close(getattr(motion, attr), getattr(baseline, attr), atol=0, rtol=0)
             frames = torch.arange(motion.num_frames)
+            for a, b in zip(motion.ref_state(frames), baseline.ref_state(frames)):
+                torch.testing.assert_close(a, b, atol=0, rtol=0)
+            for a, b in zip(motion.body_state(frames), baseline.body_state(frames)):
+                torch.testing.assert_close(a, b, atol=0, rtol=0)
+            torch.testing.assert_close(motion.clip_of(frames), baseline.clip_of(frames))
+            torch.testing.assert_close(motion.bin_of(frames), baseline.bin_of(frames))
             torch.testing.assert_close(motion.goal(frames, 10), baseline.goal(frames, 10), atol=0, rtol=0)
             mdp = MDP(self.kin, motion, torch.zeros(3), 4)
             S = motion.ref_state(frames)
@@ -80,8 +85,7 @@ class MotionNpzTest(unittest.TestCase):
         self.assertEqual(motion.names, ['a/walk', 'b/deep/walk', 'root'])
         self.assertEqual(len(motion.clip_len), 3)
         n = int(motion.clip_len[0])
-        for attr in ('root_p', 'root_R', 'q', 'root_v', 'root_w', 'body_p'):
-            data = getattr(motion, attr)
+        for data in (*motion.ref_state(torch.arange(motion.num_frames)), *motion.body_state(torch.arange(motion.num_frames))):
             torch.testing.assert_close(data[:n], data[n:2*n], atol=0, rtol=0)
 
     def test_from_dir_forwards_xyzw_and_reads_source_fps(self):
@@ -89,8 +93,9 @@ class MotionNpzTest(unittest.TestCase):
         self.write('nested/motion.npz', 'xyzw', fps=60)
         motion = MotionLib.from_dir(str(self.root), self.robot, self.kin, 'cpu', 'xyzw')
         self.assertEqual(motion.num_frames, int(np.floor((len(self.raw)-1)/60/CONTROL_DT))+1)
-        torch.testing.assert_close(motion.root_v[:, 0], torch.ones(motion.num_frames), atol=2e-6, rtol=0)
-        torch.testing.assert_close(motion.root_R[0], quat_to_mat(torch.from_numpy(self.raw[:1, 3:7]))[0])
+        S = motion.ref_state(torch.arange(motion.num_frames))
+        torch.testing.assert_close(S[2][:, 0], torch.ones(motion.num_frames), atol=2e-6, rtol=0)
+        torch.testing.assert_close(S[1][0], quat_to_mat(torch.from_numpy(self.raw[:1, 3:7]))[0], atol=5e-4, rtol=1e-4)
 
     def test_empty_directory_has_clear_error(self):
         with self.assertRaisesRegex(FileNotFoundError, 'No motions'):
@@ -111,7 +116,8 @@ class MotionNpzTest(unittest.TestCase):
         actual = ns['motion']
         expected = MotionLib([path], self.kin, 'cpu', load_lafan1_csv, 'xyzw')
         self.assertEqual(actual.names, ['nested/walk'])
-        torch.testing.assert_close(actual.root_R, expected.root_R, atol=0, rtol=0)
+        frames = torch.arange(actual.num_frames)
+        torch.testing.assert_close(actual.ref_state(frames)[1], expected.ref_state(frames)[1], atol=0, rtol=0)
         self.assertEqual(actual.num_frames, len(self.raw))
 
 

@@ -61,6 +61,7 @@ class BodyReferenceTest(unittest.TestCase):
         v, w = torch.randn(n, 3), torch.randn(n, 3)
         q, qd = torch.randn(n, 3)*.2, torch.randn(n, 3)*.3
         self.m = SimpleNamespace(root_p=p, root_R=R, root_v=v, root_w=w, q=q, qd=qd)
+        self.m.ref_state = lambda f: tuple(getattr(self.m, k)[f] for k in ('root_p', 'root_R', 'root_v', 'root_w', 'q', 'qd'))
         self.update_bodies()
         self.mdp = MDP(self.kin, self.m, torch.zeros(3), 4)
         self.f = torch.tensor([2, 6])

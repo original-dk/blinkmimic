@@ -5,6 +5,7 @@ Run: python tools/test_random_yaw_eval.py
 
 import math
 import unittest
+from types import MethodType, SimpleNamespace
 
 import torch
 
@@ -20,7 +21,7 @@ from test_relative_reward import RootKinematics
 class RandomYawEvaluationTest(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(11)
-        m = MotionLib.__new__(MotionLib)
+        m = SimpleNamespace()
         m.device, m.names, m.num_frames, m.num_bins = 'cpu', ['a', 'b'], 8, 2
         m.clip_start, m.clip_end, m.clip_len = torch.tensor([0, 4]), torch.tensor([3, 7]), torch.tensor([4, 4])
         m.clip_id = torch.arange(2).repeat_interleave(4)
@@ -34,6 +35,13 @@ class RandomYawEvaluationTest(unittest.TestCase):
         m.root_v_local = mv3(m.root_R.transpose(-1, -2), m.root_v)
         m.root_w_local = mv3(m.root_R.transpose(-1, -2), m.root_w)
         m.root_gz = m.root_R[:, 2, 2]
+        m.ref_state = lambda f: tuple(getattr(m, k)[f] for k in ('root_p', 'root_R', 'root_v', 'root_w', 'q', 'qd'))
+        m.body_state = lambda f: tuple(getattr(m, k)[f] for k in ('body_p', 'body_R', 'body_v', 'body_w'))
+        m.clip_of = lambda f: m.clip_id[f]
+        m.bin_of = lambda f: m.frame_bin[f]
+        m.reference_arrays = lambda: dict(ref_root_p=m.root_p.numpy(), ref_root_R=m.root_R.numpy(), ref_q=m.q.numpy())
+        for name in ('goal', 'goal_dim', 'future_frames'):
+            setattr(m, name, MethodType(getattr(MotionLib, name), m))
         self.source = m
 
     def test_sampling_seed_bounds_and_all_valid_frames(self):

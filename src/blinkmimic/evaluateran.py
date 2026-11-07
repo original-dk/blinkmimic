@@ -228,7 +228,7 @@ def main():
             np.savez_compressed(record, names=np.array(motion.names), yaw=yaw.cpu().numpy(),
                                 start_frame=start_frames.cpu().numpy(), init_root=env.init_root.cpu().numpy(),
                                 pos_offset=pos_offset.cpu().numpy(), rollout_clip=clip_cpu, rollout_repeat=repeat_of, **{k: torch.stack(v).numpy() for k, v in traj.items()},
-                                ref_root_p=motion.root_p.cpu().numpy(), ref_root_R=motion.root_R.cpu().numpy(), ref_q=motion.q.cpu().numpy(),
+                                **motion.reference_arrays(),
                                 clip_start=motion.clip_start.cpu().numpy(), clip_len=motion.clip_len.cpu().numpy())  # fmt: skip
         return res
 

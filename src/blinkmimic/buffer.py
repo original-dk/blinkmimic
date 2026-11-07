@@ -44,6 +44,10 @@ class ReplayBuffer:
         # instead of randint with a host bound), so the captured updates stay valid while the buffer fills
         self.size_t = None
 
+    @property
+    def storage_bytes(self) -> int:
+        return sum(t.numel() * t.element_size() for t in self.data.values())
+
     def use_device_ptr(self, device_size: bool = False):
         self.ptr_t = torch.full((), self.ptr, dtype=torch.long, device=self.device)
         if device_size:

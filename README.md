@@ -119,6 +119,60 @@ Python installation is used for training, evaluation and rendering:
 source .venv/bin/activate
 ```
 
+### Full BONES-SEED on a single 32 GiB GPU
+
+This branch stores every reference frame on the GPU as root XYZ in FP32 plus a packed FP16 state
+(quaternion, world linear/angular velocity, joint position/velocity). G1 needs **148 bytes/frame**, plus
+small clip/bin metadata and two bytes/frame when calibrated foot contacts are enabled. Queries decode
+to FP32 and normalize the quaternion before computing matrices, FK, commands and rewards. The storage
+change introduces FP16 quantization in those channels; root XYZ stays FP32. There is no full-library
+body cache or per-frame clip/bin index table. Reference FK runs only for requested batches. Initialization
+uses two passes over the files and writes each clip directly into the final allocation, with host memory
+bounded by clip size rather than retaining all decoded motions. Reference-contact preprocessing streams
+bounded FK batches and keeps only foot scalars on the CPU, then a boolean contact cache on the GPU.
+Code that reads references uses `motion.ref_state(frames)`, `motion.body_state(frames)`,
+`motion.clip_of(frames)` and `motion.bin_of(frames)` rather than full-library derived tensors.
+
+At 43 million frames, frame storage is approximately 6.36 GB, versus approximately 58 GB in the former
+FP32/body-cache layout. This is motion storage, not total training memory. Do not estimate GPU use from
+compressed NPZ disk size: source frame rates, frame counts and compression ratios differ.
+
+```bash
+PYTHON=python bash scripts/train_bones32.sh logs/bones_s0 \
+  --motion_dir /path/to/bones --motion_quat_order wxyz --seed 0
+```
+
+The entry point loads **all matching files**, including subdirectories. It uses 2048 simulator worlds,
+500 replay steps, world-model/policy batches of 1024, a 200-step training episode limit, and disables
+eprobe. Extra flags override these defaults. Actor commands, reset-relative diffs and reward coefficients
+retain their definitions. Reward settings remain in `reward_cfg.py`. Without this entry point, eprobe
+now caps simultaneous probe worlds at `--eprobe_envs 4096`, sampling tiles from the full candidate set
+per sweep. Use `--eprobe_share 0 --eprobe_async 0` to disable it entirely.
+Terminal-only reset bins reuse the last valid transition; imagined references clamp to the clip end and
+returns/bootstrap stop there, so short clips and tail frames cannot index into the next motion.
+
+Startup prints actual motion/replay storage. TensorBoard `memory/*` records PyTorch allocated, reserved
+and peak memory, plus sampled whole-device use (which also includes MuJoCo/Warp). Training failures are
+propagated through `scripts/train.sh` rather than hidden by its `tee` pipeline.
+
+Validate the **entire dataset on the target GPU** before a long run:
+
+```bash
+python tools/check_bones_memory.py \
+  --motion_dir /path/to/bones --motion_quat_order wxyz \
+  --gpu 0 --log_dir logs/bones32_check --iterations 250
+```
+
+Use an otherwise idle GPU. The check loads the full library and runs real training through graph captures,
+replay fill and episode resets; `nvidia-smi` samples whole-device memory, while TensorBoard records the
+PyTorch allocator peaks. It writes `memory_check.json`, checks that at least 250 iterations were logged,
+and exits nonzero on training failure or observed use reaching the 32 GiB budget/device capacity.
+Whole-device peaks are sampled, so this is a runtime smoke check rather than proof for every future policy
+state or long-run allocation. **This workspace has no CUDA GPU or full BONES-SEED copy: the target-card
+check has not been run here.** CPU regression tests verify storage size, streaming/FK behavior, precision,
+compiled gradients and reward consistency. Full-library evaluation should also use bounded rollout batches;
+`evaluateran --episodes 20` bounds its simulator size.
+
 ### 1. Train with relative reset rewards and random robot yaw/position
 
 ```bash

@@ -80,11 +80,12 @@ parser.add_argument("--pi_ref_skip", action="store_true",
                     help="reference-action skip connection, a = (q_ref(f+1) - q0) / alpha + network output")
 parser.add_argument("--eprobe_share", type=float, default=0.0,
                     help="evaluation-guided allocation (0 = off): this share of the resets goes to the --eprobe_win bins before "
-                         "places where the deployed policy (EMA, deterministic, no randomization or noise) fails in a sweep over "
-                         "all clips run every --eprobe_every iterations in a separate evaluation-mode simulator: one world per "
-                         "--eprobe_tile frames of each clip, started a random lead in [--eprobe_lead_min, --eprobe_lead_max] "
-                         "frames earlier on the reference")
+                         "places where the deployed policy (EMA, deterministic, no randomization or noise) fails. Every "
+                         "--eprobe_every iterations, sample at most --eprobe_envs tiles from the full library in a separate "
+                         "evaluation simulator. Tiles are spaced by --eprobe_tile frames, started a random lead in "
+                         "[--eprobe_lead_min, --eprobe_lead_max] frames earlier on the reference")
 parser.add_argument("--eprobe_tile", type=int, default=300)
+parser.add_argument("--eprobe_envs", type=int, default=4096, help="maximum simultaneous probe worlds; sample tiles per sweep")
 parser.add_argument("--eprobe_lead_min", type=int, default=200)
 parser.add_argument("--eprobe_lead_max", type=int, default=450)
 parser.add_argument("--eprobe_every", type=int, default=250)
@@ -139,6 +140,8 @@ parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"],
 args = parser.parse_args()
 if args.max_episode_steps <= 0:
     parser.error("--max_episode_steps must be positive")
+if args.eprobe_envs <= 0:
+    parser.error("--eprobe_envs must be positive")
 if args.yaw_degrees is not None and not 0 <= args.yaw_degrees <= 180:
     parser.error("--yaw_degrees must be between 0 and 180")
 if args.xy_range is not None and (not all(math.isfinite(x) for x in args.xy_range) or args.xy_range[0] > args.xy_range[1]):
@@ -183,6 +186,8 @@ if args.yaw_degrees is not None or args.xy_range is not None:
 J = robot.num_joints
 kin = Kinematics(robot, dev)
 motion = MotionLib.from_dir(args.motion_dir or robot.motion_dir, robot, kin, dev, args.motion_quat_order)
+print(f"motion: {len(motion.names)} clips, {motion.num_frames:,} frames, "
+      f"{motion.storage_bytes / 2**30:.2f} GiB stored (root XYZ FP32, other state FP16; reference FK per batch)", flush=True)
 layout = XiLayout(robot, dev)
 normalize_xi = layout.normalize
 mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), layout.dim, robot.sensing)
@@ -300,7 +305,7 @@ def _wm_err(S_hat, s1, mask):
 def _imag_step(S, o_hist, a_prev, f, xi, xi_n, g):
     a = pi(o_hist, g)
     S1 = wm.step(S, a, a_prev, xi_n)
-    f1 = f + 1
+    f1 = torch.minimum(f + 1, motion.clip_end[motion.clip_of(f)])
     o1 = mdp.add_noise(mdp.obs(S1, a, xi, f1))
     o_hist = torch.cat((o_hist[:, 1:], o1.unsqueeze(1)), 1)
     return S1, a, o_hist, f1, motion.goal(f1, K)
@@ -310,7 +315,7 @@ def _imag_step_sensed(S, o_hist, a_prev, f, xi, xi_n, g, st):
     """Imagination step with the robot's stateful signal chain (filters, delay) at the control rate."""
     a = pi(o_hist, g)
     S1 = wm.step(S, a, a_prev, xi_n)
-    f1 = f + 1
+    f1 = torch.minimum(f + 1, motion.clip_end[motion.clip_of(f)])
     gyro, accel = pipe.imu_from_states(S, S1, CONTROL_DT) if robot.sensing.imu is not None else (None, None)
     st = pipe.filter_update(st, S1[5], gyro, accel, xi, CONTROL_DT, noise=True, ctrl_rate=True)
     o1, st = pipe.observe(st, pipe.raw_obs(st, S1, a, xi, f1), noise=True, delay=True)
@@ -400,14 +405,14 @@ def sample_valid_starts(B: int):
         # candidates first (only starts within H frames of a clip end are invalid, < 1%)
         s, h = buffer.sample_starts(2 * B, Hh)
         f = s["f"]
-        ok = f + HZ <= motion.clip_end[motion.clip_id[f]]
+        ok = f + HZ <= motion.clip_end[motion.clip_of(f)]
         idx = torch.sort((~ok).to(torch.uint8), stable=True).indices[:B]
         return {k: v[idx] for k, v in s.items()}, {k: v[idx] for k, v in h.items()}
     starts, hists, n = [], [], 0
     while n < B:
         s, h = buffer.sample_starts(2 * B, Hh)
         f = s["f"]
-        ok = f + HZ <= motion.clip_end[motion.clip_id[f]]
+        ok = f + HZ <= motion.clip_end[motion.clip_of(f)]
         idx = ok.nonzero(as_tuple=False).squeeze(-1)[: B - n]
         starts.append({k: v[idx] for k, v in s.items()}), hists.append({k: v[idx] for k, v in h.items()})
         n += len(idx)
@@ -489,6 +494,10 @@ def policy_update():
     init_f = s["init_f"].unsqueeze(0).expand(HZ, -1).flatten()
     r, d = reward_term(S_all, f_all, flat(As), flat(Aps), init_root, init_f)
     r, d = r.view(HZ, B), d.view(HZ, B)
+    remaining = motion.clip_end[motion.clip_of(s["f"])] - s["f"]
+    elapsed = torch.arange(1, HZ + 1, device=dev)[:, None]
+    r = torch.where(elapsed <= remaining, r, 0.0)
+    d = torch.where(elapsed >= remaining, 1.0, d)  # no return/bootstrap beyond a clip's final transition
     v_boot = critic((critic_input_c if args.compile_more else _critic_input)(
         S, f, xi_n, g, s["init_root"], s["init_f"]))
     # --cuda_graph: survival products as a loop (cumprod's backward reads the host)
@@ -569,6 +578,9 @@ if INIT_BINS is not None:  # --resume: the checkpoint's reset-sampler statistics
     env.bin_G.copy_(INIT_BINS["bin_G"]), env.bin_fail.copy_(INIT_BINS["bin_fail"]), env.bin_w_avg.copy_(INIT_BINS["bin_w_avg"])
 buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev, J, layout.dim,
                       mdp.obs_dim if pipe.stateful else None, pipe.state_dim if pipe.stateful else None)  # fmt: skip
+print(f"replay: {buffer.storage_bytes / 2**30:.2f} GiB; "
+      f"CUDA allocated {torch.cuda.memory_allocated() / 2**30:.2f} GiB, "
+      f"reserved {torch.cuda.memory_reserved() / 2**30:.2f} GiB", flush=True)
 obs_hist = torch.zeros(args.num_envs, Hh, mdp.obs_dim, device=dev)
 
 
@@ -713,7 +725,7 @@ EPROBE = args.eprobe_share > 0  # --eprobe_share; off: code path and random stre
 if EPROBE:
     EP_TILE = torch.cat([torch.arange(int(motion.clip_start[c]), int(motion.clip_end[c]) - 1, args.eprobe_tile)
                          for c in range(len(motion.names))]).to(dev)  # fmt: skip
-    P_EP = len(EP_TILE)
+    P_EP = min(len(EP_TILE), args.eprobe_envs)
     assert pi_avg is not None, "--eprobe_share sweeps the EMA policy: needs --pi_ema"
     assert not args.eprobe_async or args.eprobe_graph, "--eprobe_async needs --eprobe_graph"
     EP_PI = copy.deepcopy(pi_avg.module) if args.eprobe_async else pi_avg.module  # sweep policy (async: a snapshot)
@@ -724,7 +736,7 @@ if EPROBE:
     # weight back over the window before it
     _nxt = torch.arange(motion.num_bins, device=dev) + 1
     EP_NEXT = torch.where((_nxt < motion.num_bins) & (motion.bin_clip[_nxt.clamp(max=motion.num_bins - 1)] == motion.bin_clip), _nxt, _nxt - 1)
-    print(f"--eprobe: {len(EP_TILE)} probe worlds (tiles of {args.eprobe_tile} frames)", flush=True)
+    print(f"--eprobe: {P_EP} probe worlds for {len(EP_TILE)} tiles (sampled per sweep)", flush=True)
 
 
 @torch.no_grad()
@@ -821,17 +833,18 @@ def eprobe_graph_setup(n_steps, stop, fcap):
 
 @torch.no_grad()
 def eprobe_burst(it):
-    """--eprobe_share: one sweep of deployed-policy rollouts (evaluation conditions, EMA policy) over all clips; first
+    """--eprobe_share: deployed-policy rollouts over at most eprobe_envs tiles, sampled from all clips; first
     failures update EP_FAIL; the focus reset distribution of the training simulator becomes the failure weights spread over
     the --eprobe_win bins before each failure."""
     m, P = motion, P_EP
     t0 = time.time()
-    cid = m.clip_id[EP_TILE]
+    tiles = EP_TILE[torch.randperm(len(EP_TILE), device=dev)[:P_EP]] if P_EP < len(EP_TILE) else EP_TILE
+    cid = m.clip_of(tiles)
     lead = int(torch.randint(args.eprobe_lead_min, args.eprobe_lead_max + 1, (1,)))
-    f0 = torch.maximum(EP_TILE - lead, m.clip_start[cid])
+    f0 = torch.maximum(tiles - lead, m.clip_start[cid])
     # a probe is done at its tile end or at the clip's last frame (the full evaluation also checks the last transition);
     # finished probes keep stepping with the frame capped so that f + 1 stays in the clip
-    stop = torch.minimum(EP_TILE + args.eprobe_tile, m.clip_end[cid])
+    stop = torch.minimum(tiles + args.eprobe_tile, m.clip_end[cid])
     fcap = torch.minimum(stop, m.clip_end[cid] - 1)
     ids = torch.arange(P, device=dev)
     penv.done_eval[:] = False
@@ -878,7 +891,7 @@ def eprobe_async_tick(launch):
 def eprobe_finish(it, lead, t0, fail_f):
     m, P = motion, P_EP
     EP_FAIL.mul_(args.eprobe_decay)
-    fb = m.frame_bin[fail_f[fail_f >= 0]]
+    fb = m.bin_of(fail_f[fail_f >= 0])
     EP_FAIL.index_add_(0, fb, torch.ones_like(fb, dtype=EP_FAIL.dtype))
     if EP_FAIL.sum() > 0:
         w, q = EP_FAIL.clone(), EP_FAIL.clone()
@@ -887,7 +900,10 @@ def eprobe_finish(it, lead, t0, fail_f):
             q += w
         env.set_focus(q / q.sum(), args.eprobe_share)
     nf = int((fail_f >= 0).sum())
-    fl = sorted({(m.names[int(m.clip_id[f])].replace("_subject", "_s"), int(f - m.clip_start[m.clip_id[f]])) for f in fail_f[fail_f >= 0].tolist()})
+    frames = fail_f[fail_f >= 0]
+    clips = m.clip_of(frames)
+    fl = sorted({(m.names[c].replace("_subject", "_s"), f) for c, f in
+                 zip(clips.tolist(), (frames - m.clip_start[clips]).tolist())})
     lag = f" | applied at it {ITER_NOW[0]}" if args.eprobe_async else ""
     print(f"--eprobe it {it}: lead {lead} | {nf}/{P} failures {fl[:8]} | {time.time() - t0:.1f} s{lag}", flush=True)
 
@@ -994,6 +1010,14 @@ for it in range(start_it, args.iterations):
             writer.add_scalar("train/" + name, value, it + 1)
         for name, value in replay_diagnostics(buffer, wm, mdp, normalize_xi, ERR_FLOOR, args.wm_window, HZ).items():
             writer.add_scalar(name, value, it + 1)
+        for name, value in (("allocated_gib", torch.cuda.memory_allocated() / 2**30),
+                            ("reserved_gib", torch.cuda.memory_reserved() / 2**30),
+                            ("peak_allocated_gib", torch.cuda.max_memory_allocated() / 2**30),
+                            ("peak_reserved_gib", torch.cuda.max_memory_reserved() / 2**30)):
+            writer.add_scalar("memory/" + name, value, it + 1)
+        free, total = torch.cuda.mem_get_info()
+        writer.add_scalar("memory/device_used_gib", (total - free) / 2**30, it + 1)
+        writer.add_scalar("memory/device_total_gib", total / 2**30, it + 1)
         writer.flush()
         print(f"it {it + 1} | {wall_h:.3f} h | wm {row[3]:.4f} e8 {row[4]:.4f} | pi {row[5]:.3f} v {row[6]:.4f} imag_r {row[7]:.3f} surv {row[9]:.3f} "
               f"| sim_r {row[10]:.3f} ep_len {row[11]:.1f} ep_ret {row[12]:.3f} term {term_frac:.2f} | {ips:.2f} it/s", flush=True)  # fmt: skip
