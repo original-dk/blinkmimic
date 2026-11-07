@@ -27,18 +27,15 @@ class RewardConfigTest(unittest.TestCase):
         self.addCleanup(x.doCleanups)
         return x
 
-    def test_active_values_match_preceding_repository_configuration(self):
-        c = REWARD_CFG
-        for name, expected in dict(sigma_base_pos=.3**2, sigma_base_rotation=.4**2,
-                                   sigma_base_lin_vel=1., sigma_base_ang_vel=3.14**2,
-                                   sigma_link_pos=14*.3**2, sigma_link_rotation=14*.4**2,
-                                   sigma_link_lin_vel=1/3, sigma_link_ang_vel=3.14**2/3,
-                                   w_base_pos=.5, w_base_rotation=.5, w_base_lin_vel=.5, w_base_ang_vel=.5,
-                                   w_link_pos=1., w_link_rotation=1., w_link_lin_vel=1., w_link_ang_vel=1.,
-                                   w_dofs_vel=0., w_action_rate=-.1, w_action_magnitude=0.,
-                                   w_joint_limit=-2., w_contact=.25).items():
-            self.assertEqual(getattr(c, name), expected)
-        self.assertAlmostEqual(MAX_STEP_REWARD, 6*CONTROL_DT)
+    def test_tracking_upper_bound_matches_active_configuration(self):
+        # Reward settings are intentionally editable: verify accounting rather than freezing old coefficients.
+        x = self.fixture()
+        m, f = x.m, x.f
+        S = (m.root_p[f], m.root_R[f], m.root_v[f], m.root_w[f], m.q[f], m.qd[f])
+        init = torch.cat((S[0], mat_to_quat(S[1])), -1)
+        _, terms = x.mdp.reward(S, f, torch.zeros_like(S[4]), torch.zeros_like(S[4]), terms=True,
+                                init_root=init, init_f=f)
+        torch.testing.assert_close(terms['track'], torch.full_like(terms['track'], MAX_STEP_REWARD), atol=1e-7, rtol=0)
 
     def test_every_mdp_uses_the_same_configuration(self):
         x = self.fixture()

@@ -1,7 +1,7 @@
 """Export a policy checkpoint to ONNX with one reference motion baked in (BeyondMimic-style deployment layout).
 
 The motion goes through the training preprocessing (resampled to 50 Hz, finite-difference velocities,
-goal features of the next K frames), so any motion file (*.csv) the robot's loader reads can be baked in.
+goal features of the next K frames), so CSV and packed qpos/fps NPZ motions can be baked in.
 
 Inputs:  obs_history (1, H, O)  raw observations, oldest first, layout of blinkmimic.mdp.MDP.obs:
                                 q - q0, qd, root angular velocity (root frame), projected gravity,
@@ -72,6 +72,7 @@ def main():
     ap.add_argument("--robot", type=str, default="g1")
     ap.add_argument("--ckpt", type=str, required=True)
     ap.add_argument("--motion", type=str, required=True, help="one motion file in the robot's format")
+    ap.add_argument("--motion_quat_order", choices=["wxyz", "xyzw"], default="wxyz", help="NPZ root quaternion order")
     ap.add_argument("--out", type=str, required=True)
     a = ap.parse_args()
 
@@ -79,7 +80,7 @@ def main():
     robot = get_robot(a.robot)
     ck = torch.load(a.ckpt, map_location=dev)
     K, Hh = ck["args"]["goal_frames"], ck["args"]["hist"]
-    motion = MotionLib([a.motion], Kinematics(robot, dev), dev, robot.load_motion)
+    motion = MotionLib([a.motion], Kinematics(robot, dev), dev, robot.load_motion, a.motion_quat_order)
     networks.AMP_DTYPE = None  # fp32 graph (training ran the MLPs under bf16 autocast)
     widths = lambda key: tuple(int(x) for x in ck["args"].get(key, "2048,1024,512,256").split(","))  # noqa: E731
     pi = Policy(obs_dim(robot.num_joints), motion.goal_dim(K), robot.num_joints, hist=Hh, enc_hidden=widths("enc_hidden"),

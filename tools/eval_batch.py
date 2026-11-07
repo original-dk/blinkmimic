@@ -38,7 +38,8 @@ dev = "cuda:0"
 robot = get_robot(args.robot)
 kin = Kinematics(robot, dev)
 _run_args = json.load(open(os.path.join(args.run_dir, "args.json"))) if os.path.exists(os.path.join(args.run_dir, "args.json")) else {}
-motion = MotionLib.from_dir(_run_args.get("motion_dir") or robot.motion_dir, robot, kin, dev)  # the run's own motion set
+motion = MotionLib.from_dir(_run_args.get("motion_dir") or robot.motion_dir, robot, kin, dev,
+                            _run_args.get("motion_quat_order", "wxyz"))  # the run's own motion set
 check_pruned(_run_args, nets_only=True, what=args.run_dir)
 mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)
 C = len(motion.names)

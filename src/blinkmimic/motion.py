@@ -20,14 +20,23 @@ BIN_FRAMES = 50  # 1 s bins for return-based reset sampling
 GOAL_Q_OFFSET = 15  # index of the joint positions q(f+1) in the goal vector (first future frame: dp 3, rot 6, v 3, w 3, then q)
 
 
+def load_npz(path: str, quat_order: str = "wxyz") -> MotionArrays:
+    """Packed qpos (root xyz, root quaternion, joints) and scalar fps; return wxyz internally."""
+    with np.load(path) as data:
+        raw, fps = data["qpos"], float(data["fps"].item())
+    quat_columns = {"wxyz": [3, 4, 5, 6], "xyzw": [6, 3, 4, 5]}[quat_order]
+    return raw[:, :3], raw[:, quat_columns], raw[:, 7:], fps
+
+
 class MotionLib:
-    def __init__(self, files: list[str], kin: Kinematics, device: str, load_motion: Callable[[str], MotionArrays]):
+    def __init__(self, files: list[str], kin: Kinematics, device: str, load_motion: Callable[[str], MotionArrays],
+                 quat_order: str = "wxyz"):
         self.device = device
         self.names = [os.path.splitext(os.path.basename(f))[0] for f in files]
         ps, qs, js = [], [], []
         lens = []
         for f in files:
-            p, quat, j, src_fps = load_motion(f)
+            p, quat, j, src_fps = load_npz(f, quat_order) if f.endswith(".npz") else load_motion(f)
             p, quat, j = (torch.tensor(x, dtype=torch.float32) for x in (p, quat, j))
             # resample to 50 Hz
             T_src = p.shape[0]
@@ -91,9 +100,14 @@ class MotionLib:
             self.frame_bin[s:e] = b
 
     @staticmethod
-    def from_dir(path: str, robot: RobotSpec, kin: Kinematics, device: str) -> MotionLib:
-        files = sorted(glob.glob(os.path.join(path, robot.motion_glob)))
-        return MotionLib(files, kin, device, robot.load_motion)
+    def from_dir(path: str, robot: RobotSpec, kin: Kinematics, device: str, quat_order: str = "wxyz") -> MotionLib:
+        files = sorted({f for pattern in (robot.motion_glob, "*.npz")
+                        for f in glob.glob(os.path.join(path, "**", pattern), recursive=True)})
+        if not files:
+            raise FileNotFoundError(f"No motions matching {robot.motion_glob} or *.npz in {path}")
+        motion = MotionLib(files, kin, device, robot.load_motion, quat_order)
+        motion.names = [os.path.splitext(os.path.relpath(f, path))[0] for f in files]
+        return motion
 
     def set_ref_contact(self, feet: list[int], margin: float = 0.015, vmax: float = 0.5, q: float = 0.05) -> None:
         """Speed-branch reference foot contact (num_frames, len(feet)): height below the clip's own floor (the

@@ -126,6 +126,8 @@ parser.add_argument("--ckpt_minutes", type=float, default=3.0, help="also checkp
 parser.add_argument("--max_hours", type=float, default=None, help="stop after this much training wall-clock")
 parser.add_argument("--log_every", type=int, default=50)
 parser.add_argument("--motion_dir", type=str, default=None, help="defaults to the robot's motion directory")
+parser.add_argument("--motion_quat_order", choices=["wxyz", "xyzw"], default="wxyz",
+                    help="NPZ root quaternion order (default: wxyz); CSV keeps the robot's format")
 parser.add_argument("--log_dir", type=str, default=os.path.join(REPO, "logs", "run"))
 parser.add_argument("--yaw_degrees", type=float, default=None,
                     help="additional uniform reset yaw offset half-range in degrees (robot default: 90; 0 disables)")
@@ -180,7 +182,7 @@ if args.yaw_degrees is not None or args.xy_range is not None:
     robot = dataclasses.replace(robot, dr=dr)
 J = robot.num_joints
 kin = Kinematics(robot, dev)
-motion = MotionLib.from_dir(args.motion_dir or robot.motion_dir, robot, kin, dev)
+motion = MotionLib.from_dir(args.motion_dir or robot.motion_dir, robot, kin, dev, args.motion_quat_order)
 layout = XiLayout(robot, dev)
 normalize_xi = layout.normalize
 mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), layout.dim, robot.sensing)

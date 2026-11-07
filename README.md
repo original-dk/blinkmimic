@@ -135,6 +135,26 @@ collection: evaluation continues to the motion's end, and `--wm_window` / `--hor
 Each new episode samples a fresh reset pose and reference frame. Compare long evaluation rollouts when
 checking drift, since shorter training episodes also shorten the time available for position error to accumulate.
 
+`--motion_dir` recursively loads CSV and NPZ files, including subdirectories. NPZ motions use the supplied
+packed format: `qpos` is `(T, 7+J)` with root XYZ, root quaternion and joint angles; `fps` is the source
+frame rate. Joint columns must follow the robot's `joint_names` order (29 joints for G1).
+Use `--motion_quat_order wxyz` (default) or `--motion_quat_order xyzw` to declare the NPZ quaternion order;
+this applies to all NPZ files in that motion set. CSV keeps its existing robot-specific interpretation
+(G1 LAFAN1: xyzw, 30 FPS), including when CSV and NPZ files share a directory. All motions use the same
+50 Hz resampling, finite-difference velocities, FK, commands and rewards after loading.
+Clip names include their relative subdirectory, for example `jumps/jump_and_land_heavy_001__A001`.
+
+```bash
+PYTHON=python bash scripts/train.sh logs/run_npz_s0 \
+  --motion_dir /path/to/motions --motion_quat_order wxyz \
+  --seed 0 --yaw_degrees 90 --xy_range 0 0.1 --pi_ref_skip \
+  --iterations 4000 --ckpt_every 1000 --max_episode_steps 200
+```
+
+Both evaluators accept the same `--motion_dir` and `--motion_quat_order` options. Pass the same values
+when evaluating this motion set. `tools/eval_batch.py` reads them from the run's `args.json`.
+ONNX export/playback also accept `--motion_quat_order` with a single NPZ supplied through `--motion`.
+
 Training samples a motion time bin using return/failure statistics, then a frame inside that bin. Each reset
 adds an independent, continuous uniform robot yaw offset in **[-90°, +90°]**, on top of the original reset noise.
 The world linear and angular velocities rotate with that yaw. Use `--yaw_degrees 90` to set this half-range,

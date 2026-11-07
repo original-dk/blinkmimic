@@ -29,6 +29,7 @@ def main():
     ap.add_argument("onnx")
     ap.add_argument("--robot", type=str, default="g1")
     ap.add_argument("--motion", type=str, required=True, help="the motion baked into the ONNX")
+    ap.add_argument("--motion_quat_order", choices=["wxyz", "xyzw"], default="wxyz", help="NPZ root quaternion order")
     a = ap.parse_args()
 
     sess = ort.InferenceSession(a.onnx, providers=["CPUExecutionProvider"])
@@ -40,7 +41,7 @@ def main():
     robot = get_robot(a.robot)
     assert ",".join(robot.joint_names) == meta["joint_names"]
     kin = Kinematics(robot, dev)
-    motion = MotionLib([a.motion], kin, dev, robot.load_motion)
+    motion = MotionLib([a.motion], kin, dev, robot.load_motion, a.motion_quat_order)
     mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)
     env = TrackingSim(make_sim(robot), 1, robot, motion, mdp, dev, eval_mode=True)
     env.done_eval[:] = False
