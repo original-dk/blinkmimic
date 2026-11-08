@@ -180,13 +180,26 @@ class VelocityTest(unittest.TestCase):
             p.square().backward()
             opt.step()
         ck = {k: copy.deepcopy(o.state_dict()) for k, o in opts.items()}
-        scope = train_functions(**opts)
-        lr_t = opts["opt_vel"].param_groups[0]["lr"]
+        scope = train_functions(args=SimpleNamespace(vel_lr=0.007), **opts)
         scope["load_opt_states"](ck)
-        self.assertIs(opts["opt_vel"].param_groups[0]["lr"], lr_t)
+        self.assertEqual(opts["opt_vel"].param_groups[0]["lr"], 0.007)
         self.assertEqual(next(iter(opts["opt_vel"].state.values()))["step"].item(), 1)
         del ck["opt_vel"]  # original main checkpoints remain loadable
         scope["load_opt_states"](ck)
+        self.assertEqual(opts["opt_vel"].param_groups[0]["lr"], 0.007)
+
+    def test_velocity_lr_independent_of_schedule(self):
+        loop = next(n for n in TRAIN.body if isinstance(n, ast.For) and isinstance(n.target, ast.Name)
+                    and n.target.id == "it")
+        schedule = next(n for n in loop.body if isinstance(n, ast.For) and isinstance(n.target, ast.Name)
+                        and n.target.id == "o")
+        opts = {name: SimpleNamespace(param_groups=[{"lr": 0.007}])
+                for name in ("opt_wm", "opt_pi", "opt_v", "opt_vel")}
+        scope = dict(torch=torch, lr=0.00001, pi_mult=4.0, **opts)
+        exec(compile(ast.Module(body=[schedule], type_ignores=[]), "train.py", "exec"), scope)
+        self.assertEqual(opts["opt_vel"].param_groups[0]["lr"], 0.007)
+        self.assertEqual(opts["opt_wm"].param_groups[0]["lr"], 0.00001)
+        self.assertEqual(opts["opt_pi"].param_groups[0]["lr"], 0.00004)
 
     def test_logging_and_checkpoints(self):
         # Execute the actual log/checkpoint expressions without simulator or file I/O.

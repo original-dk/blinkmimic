@@ -26,6 +26,7 @@ parser.add_argument("--wm_batches", type=int, default=10)
 parser.add_argument("--wm_batch", type=int, default=2048)
 parser.add_argument("--pi_batch", type=int, default=4096)
 parser.add_argument("--lr", type=float, default=2e-4)
+parser.add_argument("--vel_lr", type=float, default=2e-4, help="fixed velocity-estimator learning rate, independent of --lr")
 parser.add_argument("--gamma", type=float, default=0.99)
 parser.add_argument("--lam", type=float, default=0.95)
 parser.add_argument("--action_noise", type=float, default=0.1)
@@ -205,7 +206,7 @@ opt_v = torch.optim.Adam(critic.parameters(), **adam_kw())
 # Keep the original initialization/simulation random stream unchanged.
 with torch.random.fork_rng(devices=[dev]):
     vel = VelocityEstimator(mdp.obs_dim, hist=Hh).to(dev)
-opt_vel = torch.optim.Adam(vel.parameters(), **adam_kw())
+opt_vel = torch.optim.Adam(vel.parameters(), lr=args.vel_lr, **fused)
 vel_rng = torch.Generator(device=dev).manual_seed(args.seed)
 
 start_it, wall_offset, sim_steps = 0, 0.0, 0
@@ -213,11 +214,13 @@ start_it, wall_offset, sim_steps = 0, 0.0, 0
 
 def load_opt_states(ck: dict):
     """Optimizer states of a checkpoint; with --cuda_graph the device learning-rate tensors are kept (filled)."""
-    lr_t = {id(o): [g["lr"] for g in o.param_groups] for o in (opt_wm, opt_pi, opt_v, opt_vel)}
+    lr_t = {id(o): [g["lr"] for g in o.param_groups] for o in (opt_wm, opt_pi, opt_v)}
     opt_wm.load_state_dict(ck["opt_wm"]), opt_pi.load_state_dict(ck["opt_pi"]), opt_v.load_state_dict(ck["opt_v"])
     if "opt_vel" in ck:
         opt_vel.load_state_dict(ck["opt_vel"])
-    for o in (opt_wm, opt_pi, opt_v, opt_vel):
+    for g in opt_vel.param_groups:
+        g["lr"] = args.vel_lr  # command-line value also takes precedence on resume
+    for o in (opt_wm, opt_pi, opt_v):
         for g, lr0 in zip(o.param_groups, lr_t[id(o)]):
             if torch.is_tensor(lr0) and g["lr"] is not lr0:
                 lr0.fill_(float(g["lr"]))
@@ -934,7 +937,7 @@ for it in range(start_it, args.iterations):
     pi_mult = args.pi_lr_mult  # --lr_decay_ret: ramps to 1 after the trigger
     if DECAY_AT[0] is not None:
         pi_mult = args.pi_lr_mult + (1.0 - args.pi_lr_mult) * min(1.0, (it - DECAY_AT[0]) / max(args.lr_decay_len, 1))
-    for o in (opt_wm, opt_pi, opt_v, opt_vel):
+    for o in (opt_wm, opt_pi, opt_v):
         for gparam in o.param_groups:
             if torch.is_tensor(gparam["lr"]):
                 gparam["lr"].fill_(lr * (pi_mult if o is opt_pi else 1.0))
