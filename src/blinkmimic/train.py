@@ -208,6 +208,9 @@ with torch.random.fork_rng(devices=[dev]):
     vel = VelocityEstimator(mdp.obs_dim, hist=Hh).to(dev)
 opt_vel = torch.optim.Adam(vel.parameters(), lr=args.vel_lr, **fused)
 vel_rng = torch.Generator(device=dev).manual_seed(args.seed)
+vel_avg = copy.deepcopy(vel).requires_grad_(False)
+vel_mix = torch.zeros((), device=dev)  # device scalar: captured graphs see the changing mixture
+vel_steps = 0
 
 start_it, wall_offset, sim_steps = 0, 0.0, 0
 
@@ -238,6 +241,9 @@ if args.resume:
     wm.load_state_dict(ck["wm"]), pi.load_state_dict(ck.get("pi_live", ck["pi"])), critic.load_state_dict(ck["critic"])
     if "vel" in ck:
         vel.load_state_dict(ck["vel"])
+    vel_avg.load_state_dict(ck.get("vel_avg", vel.state_dict()))
+    vel_mix.copy_(ck.get("vel_mix", vel_mix))
+    vel_steps = ck.get("vel_steps", 0)
     load_opt_states(ck)
     start_it, wall_offset, sim_steps = ck["iteration"], ck["wall_time"], ck["sim_steps"]
     if pi_avg is not None:
@@ -261,11 +267,22 @@ ERR_FLOOR = torch.cat((torch.full((3,), 3e-3), torch.full((3,), 5e-3), torch.ful
                        torch.full((J,), 3e-3), torch.full((J,), 5e-2))).to(dev)  # fmt: skip
 
 
-def _wm_rollout(s, a, a_prev, xi):
+def _mix_velocity(S, v_est):
+    v_body = rotations.mv3(S[1].transpose(-1, -2), S[2])
+    return torch.lerp(v_body, v_est.detach(), vel_mix)
+
+
+def _velocity_input(S, o_hist):
+    with torch.no_grad():
+        v_est = vel_avg(o_hist)
+    return _mix_velocity(S, v_est)
+
+
+def _wm_rollout(s, a, a_prev, xi, v_est):
     S = unflatten_state(s[:, 0])
     preds = []
     for j in range(args.wm_window):
-        S = wm.step(S, a[:, j], a_prev[:, j], normalize_xi(xi[:, j]))
+        S = wm.step(S, a[:, j], a_prev[:, j], normalize_xi(xi[:, j]), _mix_velocity(S, v_est[:, j]))
         preds.append(S)
     return tuple(torch.stack([P[i] for P in preds], 1) for i in range(6))  # (B, k, ...)
 
@@ -287,7 +304,7 @@ def _wm_err(S_hat, s1, mask):
 
 def _imag_step(S, o_hist, a_prev, f, xi, xi_n, g):
     a = pi(o_hist, g)
-    S1 = wm.step(S, a, a_prev, xi_n)
+    S1 = wm.step(S, a, a_prev, xi_n, _velocity_input(S, o_hist))
     f1 = f + 1
     o1 = mdp.add_noise(mdp.obs(S1, a, xi, f1))
     o_hist = torch.cat((o_hist[:, 1:], o1.unsqueeze(1)), 1)
@@ -297,7 +314,7 @@ def _imag_step(S, o_hist, a_prev, f, xi, xi_n, g):
 def _imag_step_sensed(S, o_hist, a_prev, f, xi, xi_n, g, st):
     """Imagination step with the robot's stateful signal chain (filters, delay) at the control rate."""
     a = pi(o_hist, g)
-    S1 = wm.step(S, a, a_prev, xi_n)
+    S1 = wm.step(S, a, a_prev, xi_n, _velocity_input(S, o_hist))
     f1 = f + 1
     gyro, accel = pipe.imu_from_states(S, S1, CONTROL_DT) if robot.sensing.imu is not None else (None, None)
     st = pipe.filter_update(st, S1[5], gyro, accel, xi, CONTROL_DT, noise=True, ctrl_rate=True)
@@ -324,8 +341,8 @@ def _critic_loss(X, Y):
     return ((critic(X) - Y) ** 2).mean()
 
 
-def _wm_norm_data(S0, S1, a, a_prev, xi):
-    return wm.inputs(S0, a, a_prev, normalize_xi(xi)), wm.targets(S0, S1), WorldModel.increments(S0, S1)
+def _wm_norm_data(S0, S1, a, a_prev, xi, o_hist):
+    return wm.inputs(S0, a, a_prev, normalize_xi(xi), _velocity_input(S0, o_hist)), wm.targets(S0, S1), WorldModel.increments(S0, S1)
 
 
 def _critic_input(S, f, xi_n, g):
@@ -362,16 +379,18 @@ def _mirror_windows(w: dict, n: int) -> dict:
     """Replace the first n windows by their mirror images (states, actions, sim context)."""
     out = dict(w)
     ms = lambda x: flatten_state(mirror.state(unflatten_state(x)))  # noqa: E731
-    for k, fn in (("s", ms), ("s1", ms), ("a", mirror.joints), ("a_prev", mirror.joints), ("xi", mirror.xi)):
+    for k, fn in (("s", ms), ("s1", ms), ("a", mirror.joints), ("a_prev", mirror.joints), ("xi", mirror.xi), ("v_est", lambda x: x @ mirror.M)):
         out[k] = torch.cat((fn(w[k][:n]), w[k][n:]))
     return out
 
 
 def wm_update():
-    w = buffer.sample_windows(args.wm_batch, args.wm_window)
+    w = buffer.sample_windows(args.wm_batch, args.wm_window, Hh)
+    with torch.no_grad():
+        w["v_est"] = vel_avg(w.pop("o_hist"))
     if mirror is not None:
         w = _mirror_windows(w, int(args.wm_batch * args.wm_mirror))
-    S_hat = wm_rollout(w["s"], w["a"], w["a_prev"], w["xi"])
+    S_hat = wm_rollout(w["s"], w["a"], w["a_prev"], w["xi"], w["v_est"])
     loss, e_last = wm_err(S_hat, w["s1"], w["mask"])
     opt_wm.zero_grad(set_to_none=True)
     loss.backward()
@@ -395,6 +414,18 @@ def velocity_update():
     nn.utils.clip_grad_norm_(vel.parameters(), 1.0)
     opt_vel.step()
     return loss.detach().sqrt()  # per-component RMSE in m/s, before the update
+
+
+@torch.no_grad()
+def velocity_ema_update():
+    """Smooth estimator weights; warm up for 1000 updates, then ease the input mixture toward one."""
+    global vel_steps
+    torch._foreach_lerp_(list(vel_avg.parameters()), list(vel.parameters()), 0.005)
+    for avg, live in zip(vel_avg.buffers(), vel.buffers()):
+        avg.copy_(live)  # normalization statistics are already running estimates
+    vel_steps += 1
+    if vel_steps > 1000:
+        vel_mix.lerp_(torch.ones_like(vel_mix), 0.001)
 
 
 def sample_valid_starts(B: int):
@@ -465,12 +496,9 @@ def policy_update():
     S = unflatten_state(s["s"])
     xi, f, a_prev = s["xi"], s["f"], s["a_prev"]
     xi_n = normalize_xi(xi)
-    if pipe.stateful:  # the observations the policy actually saw, and the sensing state after the last one
-        o_hist, st = h["o"], pipe.unpack(s["obs_state"])
-    else:
-        with torch.no_grad():
-            o_hist = mdp.obs(unflatten_state(h["s"]), h["a_prev"], h["xi"], h["f"])
-        o_hist = mdp.add_noise(o_hist)
+    o_hist = h["o"]
+    if pipe.stateful:
+        st = pipe.unpack(s["obs_state"])
     set_requires_grad(wm, False)
     set_requires_grad(critic, False)
     B = args.pi_batch
@@ -588,7 +616,7 @@ def _collect_core():
     out["o"] = o
     buffer.add_device(out)
     S0, S1 = unflatten_state(out["s"]), unflatten_state(out["s1"])
-    wm_in, wm_out, wm_inc = (wm_norm_data_c if args.compile_more else _wm_norm_data)(S0, S1, out["a"], out["a_prev"], out["xi"])
+    wm_in, wm_out, wm_inc = (wm_norm_data_c if args.compile_more else _wm_norm_data)(S0, S1, out["a"], out["a_prev"], out["xi"], oh_new)
     wm.in_norm.update(wm_in)
     wm.out_norm.update(wm_out)
     wm.inc_norm.update(wm_inc)
@@ -680,7 +708,7 @@ def collect(n_steps: int, stats: dict):
         out["o"] = o
         buffer.add(out)
         S0, S1 = unflatten_state(out["s"]), unflatten_state(out["s1"])
-        wm_in, wm_out, wm_inc = (wm_norm_data_c if args.compile_more else _wm_norm_data)(S0, S1, out["a"], out["a_prev"], out["xi"])
+        wm_in, wm_out, wm_inc = (wm_norm_data_c if args.compile_more else _wm_norm_data)(S0, S1, out["a"], out["a_prev"], out["xi"], obs_hist)
         wm.in_norm.update(wm_in)
         wm.out_norm.update(wm_out)
         wm.inc_norm.update(wm_inc)
@@ -969,6 +997,7 @@ for it in range(start_it, args.iterations):
             pi_avg.n_averaged += 1  # ema_update (and a graph replay) does not advance the host-side counter
         agg["pi"].append(pl), agg["v"].append(vl), agg["ir"].append(ir), agg["gn"].append(gn), agg["surv"].append(surv)
     agg["vel"].append(velocity_update())
+    velocity_ema_update()
     if (it + 1) % args.log_every == 0:
         mean = lambda x: float(sum(float(v) for v in x) / max(len(x), 1))  # noqa: E731
         mean_nn = lambda x: mean([v for v in (float(v) for v in x) if v == v])  # noqa: E731  (--reset_masked: NaN = no end)
@@ -989,7 +1018,7 @@ for it in range(start_it, args.iterations):
             print(f"--lr_decay_ret: {why} at it {it + 1}: policy LR x{args.pi_lr_mult} -> x1 over {args.lr_decay_len} its", flush=True)
         log_f.flush()
         print(f"it {it + 1} | {wall_h:.3f} h | wm {row[3]:.4f} e8 {row[4]:.4f} | pi {row[5]:.3f} v {row[6]:.4f} imag_r {row[7]:.3f} surv {row[9]:.3f} "
-              f"| vel_rmse {vel_rmse:.4f} | sim_r {row[10]:.3f} ep_len {row[11]:.1f} ep_ret {row[12]:.3f} term {term_frac:.2f} | {ips:.2f} it/s", flush=True)  # fmt: skip
+              f"| vel_rmse {vel_rmse:.4f} vel_mix {float(vel_mix):.3f} | sim_r {row[10]:.3f} ep_len {row[11]:.1f} ep_ret {row[12]:.3f} term {term_frac:.2f} | {ips:.2f} it/s", flush=True)  # fmt: skip
         stats = {k: [] for k in stats}
         agg = {k: [] for k in agg}
     wall = time.time() - t_start
@@ -1001,7 +1030,9 @@ for it in range(start_it, args.iterations):
     if args.ckpt_light and not final_ck and ((it + 1) % args.ckpt_every == 0 or timed):
         sd = pi_avg.module.state_dict() if pi_avg is not None else pi.state_dict()
         small = {"pi": {k: v.detach().to("cpu", copy=True) for k, v in sd.items()},
-                 "vel": {k: v.detach().to("cpu", copy=True) for k, v in vel.state_dict().items()}, "iteration": it + 1,
+                 "vel": {k: v.detach().to("cpu", copy=True) for k, v in vel.state_dict().items()},
+                 "vel_avg": {k: v.detach().to("cpu", copy=True) for k, v in vel_avg.state_dict().items()},
+                 "vel_mix": vel_mix.detach().to("cpu", copy=True), "vel_steps": vel_steps, "iteration": it + 1,
                  "wall_time": time.time() - t_start, "sim_steps": sim_steps, "args": vars(args),
                  "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}  # fmt: skip
         path = os.path.join(args.log_dir, f"ckpt_{it + 1:06d}.pt")
@@ -1010,7 +1041,8 @@ for it in range(start_it, args.iterations):
     elif (it + 1) % args.ckpt_every == 0 or it + 1 == args.iterations or timed or out_of_time:
         ck = {"wm": wm.state_dict(), "pi": pi_avg.module.state_dict() if pi_avg is not None else pi.state_dict(), "pi_live": pi.state_dict(), "critic": critic.state_dict(), "opt_wm": opt_wm.state_dict(),
               "opt_pi": opt_pi.state_dict(), "opt_v": opt_v.state_dict(), "vel": vel.state_dict(),
-              "opt_vel": opt_vel.state_dict(), "iteration": it + 1,
+              "opt_vel": opt_vel.state_dict(), "vel_avg": vel_avg.state_dict(),
+              "vel_mix": vel_mix.clone(), "vel_steps": vel_steps, "iteration": it + 1,
               "wall_time": time.time() - t_start, "sim_steps": sim_steps, "args": vars(args),
               "pi_avg": pi_avg.state_dict() if pi_avg is not None else None,
               "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}  # fmt: skip
@@ -1021,7 +1053,7 @@ for it in range(start_it, args.iterations):
         last = os.path.join(args.log_dir, "last.pt")
         torch.save(ck, last + ".tmp")
         os.replace(last + ".tmp", last)
-        small = {k: ck[k] for k in ("pi", "pi_live", "wm", "vel", "iteration", "wall_time", "sim_steps", "args", "saved_at")}
+        small = {k: ck[k] for k in ("pi", "pi_live", "wm", "vel", "vel_avg", "vel_mix", "vel_steps", "iteration", "wall_time", "sim_steps", "args", "saved_at")}
         path = os.path.join(args.log_dir, f"ckpt_{it + 1:06d}.pt")
         torch.save(small, path + ".tmp")
         os.replace(path + ".tmp", path)

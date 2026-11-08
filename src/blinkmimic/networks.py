@@ -105,10 +105,13 @@ class WorldModel(nn.Module):
         # unless ``structured`` changes what the network outputs)
         self.inc_norm = RunningNorm(self.out_dim, eps=1e-4)
 
-    def inputs(self, S, a, a_prev, xi_n):
+    def inputs(self, S, a, a_prev, xi_n, v_body=None):
+        features = invariant_features(S)
+        if v_body is not None:  # change only the network's velocity input; integration still uses S
+            features = torch.cat((features[..., :7], v_body, features[..., 10:]), -1)
         if self.use_prev_action:
-            return torch.cat((invariant_features(S), a, a_prev, xi_n), -1)
-        return torch.cat((invariant_features(S), a, xi_n), -1)
+            return torch.cat((features, a, a_prev, xi_n), -1)
+        return torch.cat((features, a, xi_n), -1)
 
     # weight of the new velocity in the position drift: n semi-implicit substeps with a linearly changing
     # velocity give sum_k k/n / n = (n + 1) / (2 n); n = 4 substeps -> 0.625 (measured residual std of the
@@ -155,13 +158,13 @@ class WorldModel(nn.Module):
             -1,
         )
 
-    def step(self, S, a, a_prev, xi_n):
-        return self.step_c(S, a, a_prev, xi_n)[0]
+    def step(self, S, a, a_prev, xi_n, v_body=None):
+        return self.step_c(S, a, a_prev, xi_n, v_body)[0]
 
-    def step_c(self, S, a, a_prev, xi_n):
+    def step_c(self, S, a, a_prev, xi_n, v_body=None):
         """Next state and next-step foot-contact logits (B, 2), or None without ``contact_modes``."""
         p, R, v, w, q, qd = S
-        y = run_mlp(self.net, self.in_norm(self.inputs(S, a, a_prev, xi_n)))
+        y = run_mlp(self.net, self.in_norm(self.inputs(S, a, a_prev, xi_n, v_body)))
         logits = None
         if self.contact_modes:
             logits = y[..., -2:]

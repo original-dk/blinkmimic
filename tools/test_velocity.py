@@ -12,6 +12,8 @@ import torch.nn as nn
 
 from blinkmimic.buffer import ReplayBuffer
 from blinkmimic.mdp import flatten_state, obs_dim, unflatten_state
+from blinkmimic.mirror import Mirror
+from blinkmimic.robot import get_robot
 from blinkmimic.networks import Policy, VelocityEstimator, WorldModel
 from blinkmimic import rotations
 
@@ -21,7 +23,8 @@ TRAIN = ast.parse((Path(__file__).parents[1] / "src/blinkmimic/train.py").read_t
 
 def train_functions(**context):
     # Load real training functions without starting the CLI/CUDA simulator.
-    names = {"velocity_update", "collect", "_collect_core", "load_opt_states", "_wm_norm_data"}
+    names = {"velocity_update", "collect", "_collect_core", "load_opt_states", "_wm_norm_data", "_mix_velocity", "_velocity_input", "velocity_ema_update",
+             "_wm_rollout", "_imag_step", "_mirror_windows", "_wm_err", "wm_update"}
     body = [n for n in TRAIN.body if isinstance(n, ast.FunctionDef) and n.name in names]
     scope = dict(torch=torch, nn=nn, rotations=rotations, WorldModel=WorldModel,
                  unflatten_state=unflatten_state, normalize_xi=lambda x: x, **context)
@@ -70,7 +73,8 @@ class VelocityTest(unittest.TestCase):
         hist = torch.zeros(self.N, self.H, self.O)
         scope = train_functions(args=SimpleNamespace(collect_graph=False, num_envs=self.N, action_noise=0.1,
                                                      compile_more=False, reset_masked=False),
-                                pi=pi, wm=wm, vel=vel, env=env, obs_hist=hist, sim_steps=0,
+                                pi=pi, wm=wm, vel=vel, vel_avg=copy.deepcopy(vel).requires_grad_(False),
+                                vel_mix=torch.tensor(0.), env=env, obs_hist=hist, sim_steps=0,
                                 recorded=[],
                                 motion=SimpleNamespace(goal=lambda f, k: torch.zeros(len(f), 5)), K=1,
                                 CG=dict(obs_hist=hist.clone(), f=env.f.clone(),
@@ -159,6 +163,166 @@ class VelocityTest(unittest.TestCase):
         target = rotations.mv3(S[1].transpose(-1, -2), S[2])
         torch.testing.assert_close(error, (predictions[-1] - target).square().mean().sqrt())
 
+    def test_window_histories(self):
+        buf = ReplayBuffer(5, 1, "cpu", self.J, 1, self.O)
+        for t in range(8):
+            tr = {k: torch.zeros_like(v[0]) for k, v in buf.data.items()}
+            tr["o"].fill_(t)
+            tr["ep_step"].fill_(t if t < 6 else t - 6)
+            buf.add(tr)
+        w = buf.sample_windows(16, 3, self.H)
+        h = w["o_hist"][..., 0]
+        for b in range(16):
+            for j in range(3):
+                t = int(h[b, j, -1])
+                ep_step = t if t < 6 else t - 6
+                expected = [t - min(back, ep_step, t - 3) for back in (2, 1, 0)]
+                torch.testing.assert_close(h[b, j], torch.tensor(expected, dtype=h.dtype))
+
+    def test_input_mixture_and_integration(self):
+        scope = self.setup_collection()
+        wm, vel_avg = scope["wm"], scope["vel_avg"]
+        S = (torch.randn(2, 3), rotations.so3_exp(torch.randn(2, 3)),
+             torch.randn(2, 3, requires_grad=True), torch.randn(2, 3),
+             torch.randn(2, self.J), torch.randn(2, self.J))
+        a, xi = torch.randn(2, self.J), torch.zeros(2, 1)
+        h = torch.randn(2, self.H, self.O, requires_grad=True)
+        base = wm.inputs(S, a, a, xi)
+        mixed = scope["_velocity_input"](S, h)
+        torch.testing.assert_close(wm.inputs(S, a, a, xi, mixed), base)
+        scope["vel_mix"].fill_(1.)
+        predicted = scope["_velocity_input"](S, h)
+        torch.testing.assert_close(predicted, vel_avg(h))
+        features = wm.inputs(S, a, a, xi, predicted)
+        torch.testing.assert_close(features[..., :7], base[..., :7])
+        torch.testing.assert_close(features[..., 10:], base[..., 10:])
+        # A zero-output wm integrates the original state even with a different velocity input.
+        result = wm.step(S, a, a, xi, predicted)
+        torch.testing.assert_close(result, S)
+        result[2].sum().backward()
+        self.assertIsNone(h.grad)
+        self.assertTrue(all(p.grad is None for p in vel_avg.parameters()))
+        torch.testing.assert_close(S[2].grad, torch.ones_like(S[2]))
+
+    def test_velocity_ema_and_ramp(self):
+        live = VelocityEstimator(self.O, self.H)
+        avg = copy.deepcopy(live).requires_grad_(False)
+        before = [p.clone() for p in avg.parameters()]
+        with torch.no_grad():
+            for p in live.parameters():
+                p.add_(1.)
+            live.obs_norm.mean.fill_(3.)
+        scope = train_functions(vel=live, vel_avg=avg, vel_mix=torch.tensor(0.), vel_steps=999)
+        scope["velocity_ema_update"]()
+        self.assertEqual(scope["vel_mix"].item(), 0.)
+        for old, smooth in zip(before, avg.parameters()):
+            torch.testing.assert_close(smooth, old + 0.005)
+        torch.testing.assert_close(avg.obs_norm.mean, live.obs_norm.mean)
+        for _ in range(1000):
+            scope["velocity_ema_update"]()
+        self.assertAlmostEqual(scope["vel_mix"].item(), 1 - 0.999 ** 1000, places=5)
+        self.assertTrue(all(p.grad is None for p in live.parameters()))
+
+    def test_wm_rollout_and_mirror(self):
+        scope = self.setup_collection()
+        wm = scope["wm"]
+        torch.nn.init.normal_(wm.net[-1].weight, std=0.01)
+        scope["args"].wm_window = 3
+        S = (torch.randn(2, 3), torch.eye(3).expand(2, -1, -1), torch.randn(2, 3),
+             torch.randn(2, 3), torch.randn(2, self.J), torch.randn(2, self.J))
+        s = flatten_state(S)[:, None].expand(-1, 3, -1)
+        a = torch.randn(2, 3, self.J)
+        xi = torch.zeros(2, 3, 1)
+        v_est = torch.randn(2, 3, 3, requires_grad=True)
+        scope["vel_mix"].fill_(0.5)
+        result = scope["_wm_rollout"](s, a, a, xi, v_est)
+        sum(t.square().mean() for t in result).backward()
+        self.assertIsNone(v_est.grad)
+        self.assertTrue(all(p.grad is not None and p.grad.isfinite().all() for p in wm.parameters()))
+        compiled = torch.compile(scope["_wm_rollout"], backend="eager", fullgraph=True)
+        torch.testing.assert_close(compiled(s, a, a, xi, v_est), result)
+        mirror = Mirror(get_robot("g1"), {"joint_offset": slice(1, 30), "com": slice(30, 33)}, "cpu")
+        scope["mirror"] = mirror
+        scope["flatten_state"] = flatten_state
+        J = 29
+        S = (torch.randn(2, 3), torch.eye(3).expand(2, -1, -1), torch.randn(2, 3),
+             torch.randn(2, 3), torch.randn(2, J), torch.randn(2, J))
+        w = dict(s=flatten_state(S), s1=flatten_state(S), a=torch.randn(2, J),
+                 a_prev=torch.randn(2, J), xi=torch.zeros(2, 33), v_est=v_est[:, 0])
+        mirrored = scope["_mirror_windows"](w, 1)
+        torch.testing.assert_close(mirrored["v_est"][0], v_est[0, 0] @ mirror.M)
+        torch.testing.assert_close(mirrored["v_est"][1], v_est[1, 0])
+
+    def test_wm_update_uses_frozen_estimator(self):
+        scope = self.setup_collection()
+        scope["args"].wm_batch, scope["args"].wm_window = 4, 3
+        scope["args"].wm_mirror = 0.
+        scope["Hh"], scope["mirror"] = self.H, None
+        wm = scope["wm"]
+        scope["opt_wm"] = torch.optim.Adam(wm.parameters(), lr=0.001)
+        scope["ERR_FLOOR"] = torch.full((wm.out_dim,), 0.001)
+        scope["wm_err"], scope["wm_rollout"] = scope["_wm_err"], scope["_wm_rollout"]
+        buf = ReplayBuffer(5, 2, "cpu", self.J, 1, self.O)
+        for t in range(5):
+            tr = {k: torch.zeros_like(v[0]) for k, v in buf.data.items()}
+            S = (torch.full((2, 3), float(t)), torch.eye(3).expand(2, -1, -1), torch.ones(2, 3),
+                 torch.zeros(2, 3), torch.zeros(2, self.J), torch.zeros(2, self.J))
+            S1 = (S[0] + 0.1,) + S[1:]
+            tr["s"], tr["s1"] = flatten_state(S), flatten_state(S1)
+            tr["ep_step"].fill_(t)
+            tr["o"].normal_()
+            buf.add(tr)
+        scope["buffer"] = buf
+        scope["vel_mix"].fill_(0.5)
+        before = wm.net[-1].weight.detach().clone()
+        loss, last = scope["wm_update"]()
+        self.assertTrue(loss.isfinite() and last.isfinite())
+        self.assertFalse(torch.equal(before, wm.net[-1].weight))
+        self.assertTrue(all(p.grad is None for p in scope["vel_avg"].parameters()))
+        self.assertTrue(all(p.grad is None for p in scope["vel"].parameters()))
+
+    def test_imagination_uses_same_mixture(self):
+        scope = self.setup_collection()
+        torch.nn.init.normal_(scope["wm"].net[-1].weight, std=0.01)
+        scope["mdp"] = SimpleNamespace(obs=lambda S, *a: S[0][:, :1].expand(-1, self.O),
+                                        add_noise=lambda x: x)
+        S = (torch.randn(2, 3), torch.eye(3).expand(2, -1, -1), torch.randn(2, 3),
+             torch.randn(2, 3), torch.randn(2, self.J), torch.randn(2, self.J))
+        h = torch.randn(2, self.H, self.O)
+        a, xi, f, g = torch.zeros(2, self.J), torch.zeros(2, 1), torch.zeros(2, dtype=torch.long), torch.zeros(2, 5)
+        scope["vel_mix"].fill_(1.)
+        result = scope["_imag_step"](S, h, a, f, xi, xi, g)
+        expected_a = scope["pi"](h, g)
+        expected = scope["wm"].step(S, expected_a, a, xi, scope["vel_avg"](h))
+        torch.testing.assert_close(result[0], expected)
+        sum(x.square().mean() for x in result[0]).backward()
+        self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in scope["pi"].parameters()))
+        self.assertTrue(all(p.grad is None for p in scope["vel_avg"].parameters()))
+
+    def test_resume_ema_state(self):
+        resume = next(n for n in TRAIN.body if isinstance(n, ast.If) and ast.unparse(n.test) == "args.resume")
+        names = {"vel_avg.load_state_dict", "vel_mix.copy_"}
+        nodes = [n for n in resume.body if
+                 (isinstance(n, ast.Expr) and isinstance(n.value, ast.Call) and ast.unparse(n.value.func) in names)
+                 or (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "vel_steps" for t in n.targets))]
+        code = compile(ast.Module(body=nodes, type_ignores=[]), "train.py", "exec")
+        vel = VelocityEstimator(self.O, self.H)
+        avg = copy.deepcopy(vel).requires_grad_(False)
+        with torch.no_grad():
+            for p in avg.parameters():
+                p.add_(0.2)
+        scope = dict(vel=vel, vel_avg=copy.deepcopy(vel), vel_mix=torch.tensor(0.), vel_steps=0,
+                     ck=dict(vel_avg=avg.state_dict(), vel_mix=torch.tensor(0.6), vel_steps=2500))
+        exec(code, scope)
+        torch.testing.assert_close(scope["vel_avg"].state_dict(), avg.state_dict())
+        self.assertAlmostEqual(scope["vel_mix"].item(), 0.6, places=6)
+        self.assertEqual(scope["vel_steps"], 2500)
+        scope.update(ck={}, vel_mix=torch.tensor(0.))
+        exec(code, scope)
+        torch.testing.assert_close(scope["vel_avg"].state_dict(), vel.state_dict())
+        self.assertEqual(scope["vel_mix"].item(), 0.)
+        self.assertEqual(scope["vel_steps"], 0)
+
     def test_initialization_preserves_rng(self):
         node = next(n for n in TRAIN.body if isinstance(n, ast.With)
                     and "fork_rng" in ast.unparse(n.items[0].context_expr))
@@ -225,6 +389,7 @@ class VelocityTest(unittest.TestCase):
                     keys = [k.value for k in n.value.keys if isinstance(k, ast.Constant)]
                     if "pi" in keys:
                         self.assertIn("vel", keys)
+                        self.assertTrue({"vel_avg", "vel_mix", "vel_steps"}.issubset(keys))
                         if "opt_wm" in keys:
                             self.assertIn("opt_vel", keys)
 
