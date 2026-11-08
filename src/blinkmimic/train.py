@@ -206,6 +206,7 @@ opt_v = torch.optim.Adam(critic.parameters(), **adam_kw())
 with torch.random.fork_rng(devices=[dev]):
     vel = VelocityEstimator(mdp.obs_dim, hist=Hh).to(dev)
 opt_vel = torch.optim.Adam(vel.parameters(), **adam_kw())
+vel_rng = torch.Generator(device=dev).manual_seed(args.seed)
 
 start_it, wall_offset, sim_steps = 0, 0.0, 0
 
@@ -378,8 +379,14 @@ def wm_update():
 
 
 def velocity_update():
-    """One supervised update on the latest collected actor histories; independent of wm/pi."""
-    loss = (vel(obs_hist.detach()) - vel_target).square().mean()
+    """Fit simulator body velocity from recorded actor histories; no world-model data."""
+    with torch.no_grad():
+        s, h = buffer.sample_starts(args.wm_batch, Hh, generator=vel_rng)
+        S = unflatten_state(s["s"])
+        target = rotations.mv3(S[1].transpose(-1, -2), S[2])
+        o_hist = h["o"]
+        vel.obs_norm.update(o_hist[:, -1])
+    loss = (vel(o_hist) - target).square().mean()
     opt_vel.zero_grad(set_to_none=True)
     loss.backward()
     nn.utils.clip_grad_norm_(vel.parameters(), 1.0)
@@ -555,10 +562,8 @@ env = TrackingSim(sim_cfg, args.num_envs, robot, motion, mdp, dev, gamma=args.ga
 if INIT_BINS is not None:  # --resume: the checkpoint's reset-sampler statistics (episodes already running keep their start)
     env.bin_G.copy_(INIT_BINS["bin_G"]), env.bin_fail.copy_(INIT_BINS["bin_fail"]), env.bin_w_avg.copy_(INIT_BINS["bin_w_avg"])
 buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev, J, layout.dim,
-                      mdp.obs_dim if pipe.stateful else None, pipe.state_dim if pipe.stateful else None)  # fmt: skip
+                      mdp.obs_dim, pipe.state_dim if pipe.stateful else None)  # fmt: skip
 obs_hist = torch.zeros(args.num_envs, Hh, mdp.obs_dim, device=dev)
-# Aligned with obs_hist: pre-action body velocity of the latest collected transition.
-vel_target = torch.zeros(args.num_envs, 3, device=dev)
 
 
 CG = {"calls": 0}  # --collect_graph: static tensors and the graph
@@ -573,14 +578,13 @@ def _collect_core():
     oh_new = torch.where(fresh[:, None, None], o.unsqueeze(1).expand_as(oh), torch.cat((oh[:, 1:], o.unsqueeze(1)), 1))
     g = motion.goal(env.f, K)
     pi.obs_norm.update(o)
-    vel.obs_norm.update(o)
     pi.goal_norm.update(g)
     a = pi(oh_new, g)
     a = torch.clamp(a + args.action_noise * torch.randn_like(a), -20, 20)
     out = env.step_core(a)
+    out["o"] = o
     buffer.add_device(out)
     S0, S1 = unflatten_state(out["s"]), unflatten_state(out["s1"])
-    vel_target.copy_(rotations.mv3(S0[1].transpose(-1, -2), S0[2]))
     wm_in, wm_out, wm_inc = (wm_norm_data_c if args.compile_more else _wm_norm_data)(S0, S1, out["a"], out["a_prev"], out["xi"])
     wm.in_norm.update(wm_in)
     wm.out_norm.update(wm_out)
@@ -666,14 +670,13 @@ def collect(n_steps: int, stats: dict):
         obs_hist = torch.where(fresh[:, None, None], o.unsqueeze(1).expand_as(obs_hist), torch.cat((obs_hist[:, 1:], o.unsqueeze(1)), 1))
         g = motion.goal(env.f, K)
         pi.obs_norm.update(o)
-        vel.obs_norm.update(o)
         pi.goal_norm.update(g)
         a = pi(obs_hist, g)
         a = torch.clamp(a + args.action_noise * torch.randn_like(a), -20, 20)
         out = env.step(a)
+        out["o"] = o
         buffer.add(out)
         S0, S1 = unflatten_state(out["s"]), unflatten_state(out["s1"])
-        vel_target.copy_(rotations.mv3(S0[1].transpose(-1, -2), S0[2]))
         wm_in, wm_out, wm_inc = (wm_norm_data_c if args.compile_more else _wm_norm_data)(S0, S1, out["a"], out["a_prev"], out["xi"])
         wm.in_norm.update(wm_in)
         wm.out_norm.update(wm_out)

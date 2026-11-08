@@ -10,6 +10,7 @@ import unittest
 import torch
 import torch.nn as nn
 
+from blinkmimic.buffer import ReplayBuffer
 from blinkmimic.mdp import flatten_state, obs_dim, unflatten_state
 from blinkmimic.networks import Policy, VelocityEstimator, WorldModel
 from blinkmimic import rotations
@@ -70,11 +71,11 @@ class VelocityTest(unittest.TestCase):
         scope = train_functions(args=SimpleNamespace(collect_graph=False, num_envs=self.N, action_noise=0.1,
                                                      compile_more=False, reset_masked=False),
                                 pi=pi, wm=wm, vel=vel, env=env, obs_hist=hist, sim_steps=0,
-                                vel_target=torch.zeros(self.N, 3),
-                                buffer=SimpleNamespace(add=lambda _: None, add_device=lambda _: None),
+                                recorded=[],
                                 motion=SimpleNamespace(goal=lambda f, k: torch.zeros(len(f), 5)), K=1,
                                 CG=dict(obs_hist=hist.clone(), f=env.f.clone(),
                                         ep_step=env.ep_step.clone(), a_prev=env.a_prev.clone()))
+        scope["buffer"] = SimpleNamespace(add=scope["recorded"].append, add_device=scope["recorded"].append)
         return scope
 
     def test_collection_alignment_and_reset(self):
@@ -94,10 +95,10 @@ class VelocityTest(unittest.TestCase):
                     h = scope["obs_hist"]
                 torch.testing.assert_close(h, seen[-1])
                 torch.testing.assert_close(h[0], h[0, -1:].expand_as(h[0]))
-                expected = rotations.mv3(env.last_s[1].transpose(-1, -2), env.last_s[2])
-                torch.testing.assert_close(scope["vel_target"], expected)
-                self.assertFalse(scope["vel_target"].requires_grad)
-            self.assertEqual(scope["vel"].obs_norm.count.item(), 4)
+                recorded = scope["recorded"][-1]
+                torch.testing.assert_close(recorded["o"], h[:, -1])
+                torch.testing.assert_close(recorded["s"], flatten_state(env.last_s))
+                self.assertFalse(recorded["o"].requires_grad)
 
     def test_fit_and_isolation(self):
         vel = VelocityEstimator(self.O, self.H)
@@ -105,7 +106,13 @@ class VelocityTest(unittest.TestCase):
         target = h.detach()[:, -1, :3] * 0.3
         vel.obs_norm.update(h.detach())
         opt = torch.optim.Adam(vel.parameters(), lr=0.003)
-        scope = train_functions(vel=vel, obs_hist=h, vel_target=target, opt_vel=opt)
+        S = (torch.zeros(64, 3), torch.eye(3).expand(64, -1, -1), target,
+             torch.zeros(64, 3), torch.zeros(64, self.J), torch.zeros(64, self.J))
+        data = ({"s": flatten_state(S)}, {"o": h.detach()})
+        scope = train_functions(vel=vel, opt_vel=opt, Hh=self.H, args=SimpleNamespace(wm_batch=64),
+                                vel_rng=torch.Generator().manual_seed(1),
+                                buffer=SimpleNamespace(sample_starts=lambda *a, **kw: data),
+                                obs_hist=torch.full_like(h, float("nan")))
         original = Policy(self.O, 5, self.J, hist=self.H, enc_hidden=(8,), dec_hidden=(8,))
         before = copy.deepcopy(original.state_dict())
         rng = torch.get_rng_state().clone()
@@ -119,6 +126,38 @@ class VelocityTest(unittest.TestCase):
         clone = VelocityEstimator(self.O, self.H)
         clone.load_state_dict(vel.state_dict())
         torch.testing.assert_close(clone(h), vel(h))
+
+    def test_buffer_sampling_and_velocity_source(self):
+        buf = ReplayBuffer(5, 1, "cpu", self.J, 1, self.O)
+        for t in range(8):
+            tr = {k: torch.zeros_like(v[0]) for k, v in buf.data.items()}
+            R = rotations.so3_exp(torch.tensor([[0., 0., 0.7]]))
+            S = (torch.zeros(1, 3), R, torch.tensor([[float(t), 2., 3.]]),
+                 torch.zeros(1, 3), torch.zeros(1, self.J), torch.zeros(1, self.J))
+            tr["s"] = flatten_state(S)
+            tr["o"].fill_(t)
+            tr["ep_step"].fill_(t if t < 6 else t - 6)
+            buf.add(tr)
+        _, h = buf.starts_at(torch.tensor([0, 3, 4]), torch.zeros(3, dtype=torch.long), self.H)
+        torch.testing.assert_close(h["o"][:, :, 0], torch.tensor([[3., 3., 3.], [6., 6., 6.], [6., 6., 7.]]))
+        self.assertNotIn("obs_state", buf.data)
+        for device_ptr in (False, True):
+            if device_ptr:
+                buf.use_device_ptr(device_size=True)
+            rng = torch.get_rng_state().clone()
+            s, h = buf.sample_starts(16, self.H, generator=torch.Generator().manual_seed(7))
+            torch.testing.assert_close(torch.get_rng_state(), rng)
+            S = unflatten_state(s["s"])
+            torch.testing.assert_close(S[2][:, 0], h["o"][:, -1, 0])
+        vel = VelocityEstimator(self.O, self.H)
+        predictions = []
+        vel.register_forward_hook(lambda m, inp, out: predictions.append(out.detach().clone()))
+        scope = train_functions(vel=vel, opt_vel=torch.optim.Adam(vel.parameters()),
+                                args=SimpleNamespace(wm_batch=16), Hh=self.H,
+                                vel_rng=torch.Generator().manual_seed(7), buffer=buf)
+        error = scope["velocity_update"]()
+        target = rotations.mv3(S[1].transpose(-1, -2), S[2])
+        torch.testing.assert_close(error, (predictions[-1] - target).square().mean().sqrt())
 
     def test_initialization_preserves_rng(self):
         node = next(n for n in TRAIN.body if isinstance(n, ast.With)

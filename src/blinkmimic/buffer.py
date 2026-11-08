@@ -20,8 +20,9 @@ def fields(num_j: int, xi_dim: int, obs_dim: int | None = None, obs_state_dim: i
         "done": ((), torch.bool),
         "cut": ((), torch.bool),
     }
-    if obs_dim is not None:  # stateful sensing: the observation as seen and the sensing state after it
+    if obs_dim is not None:  # the observation actually seen by the actor
         out["o"] = (obs_dim, torch.float32)
+    if obs_state_dim is not None:
         out["obs_state"] = (obs_state_dim, torch.float32)
     return out
 
@@ -47,11 +48,11 @@ class ReplayBuffer:
         if device_size:
             self.size_t = torch.full((), self.size, dtype=torch.long, device=self.device)
 
-    def _randint(self, n, B: int) -> torch.Tensor:
+    def _randint(self, n, B: int, generator: torch.Generator | None = None) -> torch.Tensor:
         """Uniform integers in [0, n) with n a host int, or (--graph_early) a device tensor."""
         if self.size_t is None:
-            return torch.randint(0, n, (B,), device=self.device)
-        return torch.minimum((torch.rand(B, device=self.device) * n).long(), n - 1)
+            return torch.randint(0, n, (B,), device=self.device, generator=generator)
+        return torch.minimum((torch.rand(B, device=self.device, generator=generator) * n).long(), n - 1)
 
     def add(self, tr: dict):
         for k in self.fields:
@@ -96,10 +97,10 @@ class ReplayBuffer:
         out["mask"] = mask
         return out
 
-    def sample_starts(self, B: int, hist: int):
+    def sample_starts(self, B: int, hist: int, generator: torch.Generator | None = None):
         """Start points for imagination plus the indices of their observation history (oldest first)."""
-        age = self._randint(self.size_t if self.size_t is not None else self.size, B)
-        env = torch.randint(0, self.N, (B,), device=self.device)
+        age = self._randint(self.size_t if self.size_t is not None else self.size, B, generator)
+        env = torch.randint(0, self.N, (B,), device=self.device, generator=generator)
         return self.starts_at(age, env, hist)
 
     def starts_at(self, age: torch.Tensor, env: torch.Tensor, hist: int):
@@ -111,7 +112,7 @@ class ReplayBuffer:
         back = torch.minimum(back, age.unsqueeze(-1))  # stay inside the buffer
         hrows = self._row(age.unsqueeze(-1) - back)
         henv = env.unsqueeze(-1).expand_as(hrows)
-        stateful = "o" in self.data
+        stateful = "obs_state" in self.data
         start = {k: self.data[k][row, env] for k in ("s", "a_prev", "xi", "f") + (("obs_state",) if stateful else ())}
-        hist_d = {k: self.data[k][hrows, henv] for k in ("s", "a_prev", "xi", "f") + (("o",) if stateful else ())}
+        hist_d = {k: self.data[k][hrows, henv] for k in ("s", "a_prev", "xi", "f") + (("o",) if "o" in self.data else ())}
         return start, hist_d
