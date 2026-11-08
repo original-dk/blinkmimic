@@ -20,8 +20,9 @@ def fields(num_j: int, xi_dim: int, obs_dim: int | None = None, obs_state_dim: i
         "done": ((), torch.bool),
         "cut": ((), torch.bool),
     }
-    if obs_dim is not None:  # stateful sensing: the observation as seen and the sensing state after it
+    if obs_dim is not None:  # the observation as seen by the actor
         out["o"] = (obs_dim, torch.float32)
+    if obs_state_dim is not None:
         out["obs_state"] = (obs_state_dim, torch.float32)
     return out
 
@@ -82,8 +83,8 @@ class ReplayBuffer:
         size = self.size_t if self.size_t is not None else self.size
         return (ptr - size + age) % self.T
 
-    def sample_windows(self, B: int, k: int):
-        """k-step windows; returns dict of (B, k, ...) tensors and a validity mask (B, k)."""
+    def sample_windows(self, B: int, k: int, hist: int):
+        """k-step windows, their initial actor history (oldest first), and a validity mask (B, k)."""
         t0 = self._randint((self.size_t if self.size_t is not None else self.size) - k + 1, B)
         env = torch.randint(0, self.N, (B,), device=self.device)
         ages = t0.unsqueeze(-1) + torch.arange(k, device=self.device)
@@ -94,6 +95,10 @@ class ReplayBuffer:
         d = out["cut"].float()
         mask = torch.cumprod(torch.cat((torch.ones(B, 1, device=self.device), 1 - d[:, :-1]), -1), -1)
         out["mask"] = mask
+        start, h = self.starts_at(t0, env, hist)
+        out["o_hist"], out["f"] = h["o"], start["f"]
+        if "obs_state" in start:
+            out["obs_state"] = start["obs_state"]
         return out
 
     def sample_starts(self, B: int, hist: int):
@@ -111,7 +116,7 @@ class ReplayBuffer:
         back = torch.minimum(back, age.unsqueeze(-1))  # stay inside the buffer
         hrows = self._row(age.unsqueeze(-1) - back)
         henv = env.unsqueeze(-1).expand_as(hrows)
-        stateful = "o" in self.data
+        stateful = "obs_state" in self.data
         start = {k: self.data[k][row, env] for k in ("s", "a_prev", "xi", "f") + (("obs_state",) if stateful else ())}
-        hist_d = {k: self.data[k][hrows, henv] for k in ("s", "a_prev", "xi", "f") + (("o",) if stateful else ())}
+        hist_d = {k: self.data[k][hrows, henv] for k in ("s", "a_prev", "xi", "f") + (("o",) if "o" in self.data else ())}
         return start, hist_d

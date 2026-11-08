@@ -32,6 +32,13 @@ class Mirror:
     def joints(self, x: torch.Tensor) -> torch.Tensor:
         return x[..., self.perm] * self.sign
 
+    def obs(self, o: torch.Tensor) -> torch.Tensor:
+        J = self.perm.numel()
+        q, qd, w, g, a, rel = o.split((J, J, 3, 3, J, 6), -1)
+        rel = self.M @ rel.unflatten(-1, (3, 2)) @ self.M[:2, :2]
+        return torch.cat((self.joints(q), self.joints(qd), -(w @ self.M), g @ self.M,
+                          self.joints(a), rel.flatten(-2)), -1)
+
     def state(self, S):
         p, R, v, w, q, qd = S
         M = self.M

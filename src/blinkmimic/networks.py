@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .mdp import inv_dim, invariant_features
+from .mdp import obs_dim
 from .rotations import mm3, mv3, so3_exp, yaw_mat
 
 
@@ -74,14 +74,16 @@ def run_mlp(net: nn.Module, x: torch.Tensor) -> torch.Tensor:
 
 
 class WorldModel(nn.Module):
-    """Deterministic dynamics s_{t+1} = f(s_t, a_t, xi) predicting frame-local state increments.
+    """Dynamics from actor observation history, actions and xi, predicting frame-local state increments.
 
+    The network sees the same ``hist`` observations as the actor; the full state is used only
+    for integration and training targets. Outputs retain the original frame-local increment layout.
     With ``use_prev_action`` the model also sees a_{t-1}: delayed actuators still track the previous
     action's target during the first physics steps of a control step.
     """
 
     def __init__(self, num_j: int, xi_dim: int, use_prev_action: bool = False, hidden=(2048, 2048, 2048),
-                 contact_modes: bool = False, structured: bool = False, dt: float = 0.02):  # fmt: skip
+                 contact_modes: bool = False, structured: bool = False, dt: float = 0.02, hist: int = 10):  # fmt: skip
         """``contact_modes`` (InstantTrack): the last layer predicts the two feet's next-step ground contact
         and one increment head per contact mode (flight, left, right, double support); the increment is the
         mixture of the heads weighted by the predicted mode probabilities, so each head stays smooth within
@@ -93,7 +95,7 @@ class WorldModel(nn.Module):
         # ``structured`` = semi-implicit integration (positions follow the predicted velocities,
         # the net predicts velocity increments plus small position corrections)
         self.structured, self.dt = structured, dt
-        self.in_dim = inv_dim(num_j) + num_j * (2 if use_prev_action else 1) + xi_dim
+        self.in_dim = obs_dim(num_j) * hist + num_j * (2 if use_prev_action else 1) + xi_dim
         self.out_dim = 3 + 3 + 3 + 3 + num_j + num_j
         n_out = 4 * self.out_dim + 2 if contact_modes else self.out_dim
         self.net = mlp(self.in_dim, list(hidden), n_out, act=nn.SiLU, layer_norm=True)
@@ -105,10 +107,10 @@ class WorldModel(nn.Module):
         # unless ``structured`` changes what the network outputs)
         self.inc_norm = RunningNorm(self.out_dim, eps=1e-4)
 
-    def inputs(self, S, a, a_prev, xi_n):
+    def inputs(self, o_hist, a, a_prev, xi_n):
         if self.use_prev_action:
-            return torch.cat((invariant_features(S), a, a_prev, xi_n), -1)
-        return torch.cat((invariant_features(S), a, xi_n), -1)
+            return torch.cat((o_hist.flatten(-2), a, a_prev, xi_n), -1)
+        return torch.cat((o_hist.flatten(-2), a, xi_n), -1)
 
     # weight of the new velocity in the position drift: n semi-implicit substeps with a linearly changing
     # velocity give sum_k k/n / n = (n + 1) / (2 n); n = 4 substeps -> 0.625 (measured residual std of the
@@ -155,13 +157,13 @@ class WorldModel(nn.Module):
             -1,
         )
 
-    def step(self, S, a, a_prev, xi_n):
-        return self.step_c(S, a, a_prev, xi_n)[0]
+    def step(self, S, o_hist, a, a_prev, xi_n):
+        return self.step_c(S, o_hist, a, a_prev, xi_n)[0]
 
-    def step_c(self, S, a, a_prev, xi_n):
+    def step_c(self, S, o_hist, a, a_prev, xi_n):
         """Next state and next-step foot-contact logits (B, 2), or None without ``contact_modes``."""
         p, R, v, w, q, qd = S
-        y = run_mlp(self.net, self.in_norm(self.inputs(S, a, a_prev, xi_n)))
+        y = run_mlp(self.net, self.in_norm(self.inputs(o_hist, a, a_prev, xi_n)))
         logits = None
         if self.contact_modes:
             logits = y[..., -2:]

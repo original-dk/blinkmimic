@@ -174,7 +174,7 @@ networks.RunningNorm.no_sync = args.no_sync
 rotations.ELEMENTWISE = args.fused_rot
 
 wm = WorldModel(J, layout.dim, use_prev_action=robot.has_action_delay, hidden=widths(args.wm_hidden),
-                structured=args.wm_structured, dt=CONTROL_DT).to(dev)  # fmt: skip
+                structured=args.wm_structured, dt=CONTROL_DT, hist=Hh).to(dev)  # fmt: skip
 pi = Policy(mdp.obs_dim, GOAL_DIM, J, hist=Hh, enc_hidden=widths(args.enc_hidden), dec_hidden=widths(args.dec_hidden),
             **policy_kwargs(vars(args), robot)).to(dev)
 critic = Critic(CRITIC_IN).to(dev)
@@ -249,11 +249,34 @@ ERR_FLOOR = torch.cat((torch.full((3,), 3e-3), torch.full((3,), 5e-3), torch.ful
                        torch.full((J,), 3e-3), torch.full((J,), 5e-2))).to(dev)  # fmt: skip
 
 
-def _wm_rollout(s, a, a_prev, xi):
+def _wm_rollout(w):
+    s, a, a_prev, xi = (w[k] for k in ("s", "a", "a_prev", "xi"))
     S = unflatten_state(s[:, 0])
+    o_hist, f = w["o_hist"], w["f"]
+    if pipe.stateful:
+        st = pipe.unpack(w["obs_state"])
+    end = motion.clip_end[motion.clip_id[f]]
     preds = []
     for j in range(args.wm_window):
-        S = wm.step(S, a[:, j], a_prev[:, j], normalize_xi(xi[:, j]))
+        S1 = wm.step(S, o_hist, a[:, j], a_prev[:, j], normalize_xi(xi[:, j]))
+        f = torch.minimum(f + 1, end)
+        So, So1, ao, xo = S, S1, a[:, j], xi[:, j]
+        if mirror is not None:
+            n = int(args.wm_batch * args.wm_mirror)
+            ms = lambda state: tuple(torch.cat((m[:n], x[n:])) for m, x in zip(mirror.state(state), state))  # noqa: E731
+            So, So1 = ms(S), ms(S1)
+            ao = torch.cat((mirror.joints(ao[:n]), ao[n:]))
+            xo = torch.cat((mirror.xi(xo[:n]), xo[n:]))
+        if pipe.stateful:
+            gyro, accel = pipe.imu_from_states(So, So1, CONTROL_DT) if robot.sensing.imu is not None else (None, None)
+            st = pipe.filter_update(st, So1[5], gyro, accel, xo, CONTROL_DT, noise=True, ctrl_rate=True)
+            o1, st = pipe.observe(st, pipe.raw_obs(st, So1, ao, xo, f), noise=True, delay=True)
+        else:
+            o1 = mdp.add_noise(mdp.obs(So1, ao, xo, f))
+        if mirror is not None:
+            o1 = torch.cat((mirror.obs(o1[:n]), o1[n:]))
+        o_hist = torch.cat((o_hist[:, 1:], o1.unsqueeze(1)), 1)
+        S = S1
         preds.append(S)
     return tuple(torch.stack([P[i] for P in preds], 1) for i in range(6))  # (B, k, ...)
 
@@ -275,7 +298,7 @@ def _wm_err(S_hat, s1, mask):
 
 def _imag_step(S, o_hist, a_prev, f, xi, xi_n, g):
     a = pi(o_hist, g)
-    S1 = wm.step(S, a, a_prev, xi_n)
+    S1 = wm.step(S, o_hist, a, a_prev, xi_n)
     f1 = f + 1
     o1 = mdp.add_noise(mdp.obs(S1, a, xi, f1))
     o_hist = torch.cat((o_hist[:, 1:], o1.unsqueeze(1)), 1)
@@ -285,7 +308,7 @@ def _imag_step(S, o_hist, a_prev, f, xi, xi_n, g):
 def _imag_step_sensed(S, o_hist, a_prev, f, xi, xi_n, g, st):
     """Imagination step with the robot's stateful signal chain (filters, delay) at the control rate."""
     a = pi(o_hist, g)
-    S1 = wm.step(S, a, a_prev, xi_n)
+    S1 = wm.step(S, o_hist, a, a_prev, xi_n)
     f1 = f + 1
     gyro, accel = pipe.imu_from_states(S, S1, CONTROL_DT) if robot.sensing.imu is not None else (None, None)
     st = pipe.filter_update(st, S1[5], gyro, accel, xi, CONTROL_DT, noise=True, ctrl_rate=True)
@@ -312,8 +335,8 @@ def _critic_loss(X, Y):
     return ((critic(X) - Y) ** 2).mean()
 
 
-def _wm_norm_data(S0, S1, a, a_prev, xi):
-    return wm.inputs(S0, a, a_prev, normalize_xi(xi)), wm.targets(S0, S1), WorldModel.increments(S0, S1)
+def _wm_norm_data(S0, S1, o_hist, a, a_prev, xi):
+    return wm.inputs(o_hist, a, a_prev, normalize_xi(xi)), wm.targets(S0, S1), WorldModel.increments(S0, S1)
 
 
 def _critic_input(S, f, xi_n, g):
@@ -350,16 +373,16 @@ def _mirror_windows(w: dict, n: int) -> dict:
     """Replace the first n windows by their mirror images (states, actions, sim context)."""
     out = dict(w)
     ms = lambda x: flatten_state(mirror.state(unflatten_state(x)))  # noqa: E731
-    for k, fn in (("s", ms), ("s1", ms), ("a", mirror.joints), ("a_prev", mirror.joints), ("xi", mirror.xi)):
+    for k, fn in (("s", ms), ("s1", ms), ("a", mirror.joints), ("a_prev", mirror.joints), ("xi", mirror.xi), ("o_hist", mirror.obs)):
         out[k] = torch.cat((fn(w[k][:n]), w[k][n:]))
     return out
 
 
 def wm_update():
-    w = buffer.sample_windows(args.wm_batch, args.wm_window)
+    w = buffer.sample_windows(args.wm_batch, args.wm_window, Hh)
     if mirror is not None:
         w = _mirror_windows(w, int(args.wm_batch * args.wm_mirror))
-    S_hat = wm_rollout(w["s"], w["a"], w["a_prev"], w["xi"])
+    S_hat = wm_rollout(w)
     loss, e_last = wm_err(S_hat, w["s1"], w["mask"])
     opt_wm.zero_grad(set_to_none=True)
     loss.backward()
@@ -437,12 +460,9 @@ def policy_update():
     S = unflatten_state(s["s"])
     xi, f, a_prev = s["xi"], s["f"], s["a_prev"]
     xi_n = normalize_xi(xi)
-    if pipe.stateful:  # the observations the policy actually saw, and the sensing state after the last one
-        o_hist, st = h["o"], pipe.unpack(s["obs_state"])
-    else:
-        with torch.no_grad():
-            o_hist = mdp.obs(unflatten_state(h["s"]), h["a_prev"], h["xi"], h["f"])
-        o_hist = mdp.add_noise(o_hist)
+    o_hist = h["o"]  # the observations the policy actually saw
+    if pipe.stateful:
+        st = pipe.unpack(s["obs_state"])
     set_requires_grad(wm, False)
     set_requires_grad(critic, False)
     B = args.pi_batch
@@ -537,7 +557,7 @@ env = TrackingSim(sim_cfg, args.num_envs, robot, motion, mdp, dev, gamma=args.ga
 if INIT_BINS is not None:  # --resume: the checkpoint's reset-sampler statistics (episodes already running keep their start)
     env.bin_G.copy_(INIT_BINS["bin_G"]), env.bin_fail.copy_(INIT_BINS["bin_fail"]), env.bin_w_avg.copy_(INIT_BINS["bin_w_avg"])
 buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev, J, layout.dim,
-                      mdp.obs_dim if pipe.stateful else None, pipe.state_dim if pipe.stateful else None)  # fmt: skip
+                      mdp.obs_dim, pipe.state_dim if pipe.stateful else None)  # fmt: skip
 obs_hist = torch.zeros(args.num_envs, Hh, mdp.obs_dim, device=dev)
 
 
@@ -557,9 +577,10 @@ def _collect_core():
     a = pi(oh_new, g)
     a = torch.clamp(a + args.action_noise * torch.randn_like(a), -20, 20)
     out = env.step_core(a)
+    out["o"] = o
     buffer.add_device(out)
     S0, S1 = unflatten_state(out["s"]), unflatten_state(out["s1"])
-    wm_in, wm_out, wm_inc = (wm_norm_data_c if args.compile_more else _wm_norm_data)(S0, S1, out["a"], out["a_prev"], out["xi"])
+    wm_in, wm_out, wm_inc = (wm_norm_data_c if args.compile_more else _wm_norm_data)(S0, S1, oh_new, out["a"], out["a_prev"], out["xi"])
     wm.in_norm.update(wm_in)
     wm.out_norm.update(wm_out)
     wm.inc_norm.update(wm_inc)
@@ -648,9 +669,10 @@ def collect(n_steps: int, stats: dict):
         a = pi(obs_hist, g)
         a = torch.clamp(a + args.action_noise * torch.randn_like(a), -20, 20)
         out = env.step(a)
+        out["o"] = o
         buffer.add(out)
         S0, S1 = unflatten_state(out["s"]), unflatten_state(out["s1"])
-        wm_in, wm_out, wm_inc = (wm_norm_data_c if args.compile_more else _wm_norm_data)(S0, S1, out["a"], out["a_prev"], out["xi"])
+        wm_in, wm_out, wm_inc = (wm_norm_data_c if args.compile_more else _wm_norm_data)(S0, S1, obs_hist, out["a"], out["a_prev"], out["xi"])
         wm.in_norm.update(wm_in)
         wm.out_norm.update(wm_out)
         wm.inc_norm.update(wm_inc)
