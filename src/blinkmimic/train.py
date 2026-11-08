@@ -142,7 +142,7 @@ from blinkmimic.mdp import MDP, inv_dim, unflatten_state
 from blinkmimic.motion import CONTROL_DT, MotionLib
 import blinkmimic.networks as networks
 import blinkmimic.rotations as rotations
-from blinkmimic.networks import Critic, Policy, WorldModel, check_pruned, policy_kwargs
+from blinkmimic.networks import Critic, Policy, VelocityEstimator, WorldModel, check_pruned, policy_kwargs
 from blinkmimic.mirror import Mirror
 from blinkmimic.objective import actor_objective
 from blinkmimic.mdp import flatten_state
@@ -202,15 +202,21 @@ NONFINITE = torch.zeros((), dtype=torch.long, device=dev)  # --no_sync: skipped 
 pi_avg = torch.optim.swa_utils.AveragedModel(pi, multi_avg_fn=torch.optim.swa_utils.get_ema_multi_avg_fn(args.pi_ema),
                                              use_buffers=True) if args.pi_ema > 0 else None  # fmt: skip
 opt_v = torch.optim.Adam(critic.parameters(), **adam_kw())
+# Keep the original initialization/simulation random stream unchanged.
+with torch.random.fork_rng(devices=[dev]):
+    vel = VelocityEstimator(mdp.obs_dim, hist=Hh).to(dev)
+opt_vel = torch.optim.Adam(vel.parameters(), **adam_kw())
 
 start_it, wall_offset, sim_steps = 0, 0.0, 0
 
 
 def load_opt_states(ck: dict):
     """Optimizer states of a checkpoint; with --cuda_graph the device learning-rate tensors are kept (filled)."""
-    lr_t = {id(o): [g["lr"] for g in o.param_groups] for o in (opt_wm, opt_pi, opt_v)}
+    lr_t = {id(o): [g["lr"] for g in o.param_groups] for o in (opt_wm, opt_pi, opt_v, opt_vel)}
     opt_wm.load_state_dict(ck["opt_wm"]), opt_pi.load_state_dict(ck["opt_pi"]), opt_v.load_state_dict(ck["opt_v"])
-    for o in (opt_wm, opt_pi, opt_v):
+    if "opt_vel" in ck:
+        opt_vel.load_state_dict(ck["opt_vel"])
+    for o in (opt_wm, opt_pi, opt_v, opt_vel):
         for g, lr0 in zip(o.param_groups, lr_t[id(o)]):
             if torch.is_tensor(lr0) and g["lr"] is not lr0:
                 lr0.fill_(float(g["lr"]))
@@ -226,6 +232,8 @@ if args.resume:
     assert "opt_pi" in ck, f"--resume {args.resume}: no optimizer state (use last.pt)"
     check_pruned(ck.get("args", {}), what=args.resume)
     wm.load_state_dict(ck["wm"]), pi.load_state_dict(ck.get("pi_live", ck["pi"])), critic.load_state_dict(ck["critic"])
+    if "vel" in ck:
+        vel.load_state_dict(ck["vel"])
     load_opt_states(ck)
     start_it, wall_offset, sim_steps = ck["iteration"], ck["wall_time"], ck["sim_steps"]
     if pi_avg is not None:
@@ -367,6 +375,16 @@ def wm_update():
     opt_wm.step()
     m = w["mask"][:, -1]
     return loss.detach() / args.wm_window, (e_last.detach() * m).sum() / m.sum().clamp(min=1)
+
+
+def velocity_update():
+    """One supervised update on the latest collected actor histories; independent of wm/pi."""
+    loss = (vel(obs_hist.detach()) - vel_target).square().mean()
+    opt_vel.zero_grad(set_to_none=True)
+    loss.backward()
+    nn.utils.clip_grad_norm_(vel.parameters(), 1.0)
+    opt_vel.step()
+    return loss.detach().sqrt()  # per-component RMSE in m/s, before the update
 
 
 def sample_valid_starts(B: int):
@@ -539,6 +557,8 @@ if INIT_BINS is not None:  # --resume: the checkpoint's reset-sampler statistics
 buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev, J, layout.dim,
                       mdp.obs_dim if pipe.stateful else None, pipe.state_dim if pipe.stateful else None)  # fmt: skip
 obs_hist = torch.zeros(args.num_envs, Hh, mdp.obs_dim, device=dev)
+# Aligned with obs_hist: pre-action body velocity of the latest collected transition.
+vel_target = torch.zeros(args.num_envs, 3, device=dev)
 
 
 CG = {"calls": 0}  # --collect_graph: static tensors and the graph
@@ -553,12 +573,14 @@ def _collect_core():
     oh_new = torch.where(fresh[:, None, None], o.unsqueeze(1).expand_as(oh), torch.cat((oh[:, 1:], o.unsqueeze(1)), 1))
     g = motion.goal(env.f, K)
     pi.obs_norm.update(o)
+    vel.obs_norm.update(o)
     pi.goal_norm.update(g)
     a = pi(oh_new, g)
     a = torch.clamp(a + args.action_noise * torch.randn_like(a), -20, 20)
     out = env.step_core(a)
     buffer.add_device(out)
     S0, S1 = unflatten_state(out["s"]), unflatten_state(out["s1"])
+    vel_target.copy_(rotations.mv3(S0[1].transpose(-1, -2), S0[2]))
     wm_in, wm_out, wm_inc = (wm_norm_data_c if args.compile_more else _wm_norm_data)(S0, S1, out["a"], out["a_prev"], out["xi"])
     wm.in_norm.update(wm_in)
     wm.out_norm.update(wm_out)
@@ -644,12 +666,14 @@ def collect(n_steps: int, stats: dict):
         obs_hist = torch.where(fresh[:, None, None], o.unsqueeze(1).expand_as(obs_hist), torch.cat((obs_hist[:, 1:], o.unsqueeze(1)), 1))
         g = motion.goal(env.f, K)
         pi.obs_norm.update(o)
+        vel.obs_norm.update(o)
         pi.goal_norm.update(g)
         a = pi(obs_hist, g)
         a = torch.clamp(a + args.action_noise * torch.randn_like(a), -20, 20)
         out = env.step(a)
         buffer.add(out)
         S0, S1 = unflatten_state(out["s"]), unflatten_state(out["s1"])
+        vel_target.copy_(rotations.mv3(S0[1].transpose(-1, -2), S0[2]))
         wm_in, wm_out, wm_inc = (wm_norm_data_c if args.compile_more else _wm_norm_data)(S0, S1, out["a"], out["a_prev"], out["xi"])
         wm.in_norm.update(wm_in)
         wm.out_norm.update(wm_out)
@@ -867,8 +891,9 @@ log_path = os.path.join(args.log_dir, "train_log.csv")
 log_f = open(log_path, "a")
 if start_it == 0:
     log_f.write("iteration,wall_h,sim_steps,wm_loss,wm_err8,pi_loss,v_loss,imag_rew,pi_gradnorm,imag_survival,sim_rew,ep_len,ep_ret_norm,term_frac,it_per_s,lr"
-                ",pi_lr,pi_mult,nonfinite\n")  # fmt: skip
+                ",pi_lr,pi_mult,nonfinite,vel_rmse\n")  # fmt: skip
     log_f.flush()
+LOG_VEL = "vel_rmse" in open(log_path).readline()
 LOG_EXTRA = "pi_lr" in open(log_path).readline()  # lr = base LR; pi_lr = policy LR (x pi_mult)
 # --ckpt_light: one background writer; a failed write is re-raised in the training loop (or at the end), at most 2 queued
 CKPT_POOL, CKPT_PENDING = (ThreadPoolExecutor(max_workers=1) if args.ckpt_light else None), []
@@ -888,7 +913,7 @@ t_start = time.time() - wall_offset
 next_ckpt_s = wall_offset + args.ckpt_minutes * 60
 t_log = time.time()
 step_acc = 0.0
-agg = {"wm": [], "wm8": [], "pi": [], "v": [], "ir": [], "gn": [], "surv": []}
+agg = {"wm": [], "wm8": [], "pi": [], "v": [], "ir": [], "gn": [], "surv": [], "vel": []}
 # first iteration with a policy update (after --wm_only_iters); a resumed run is past it
 POLICY_START = args.wm_only_iters if (start_it > 0 or args.wm_only_iters == 0) else None
 DECAY_AT = [None]  # --lr_decay_ret: iteration of the trigger
@@ -906,7 +931,7 @@ for it in range(start_it, args.iterations):
     pi_mult = args.pi_lr_mult  # --lr_decay_ret: ramps to 1 after the trigger
     if DECAY_AT[0] is not None:
         pi_mult = args.pi_lr_mult + (1.0 - args.pi_lr_mult) * min(1.0, (it - DECAY_AT[0]) / max(args.lr_decay_len, 1))
-    for o in (opt_wm, opt_pi, opt_v):
+    for o in (opt_wm, opt_pi, opt_v, opt_vel):
         for gparam in o.param_groups:
             if torch.is_tensor(gparam["lr"]):
                 gparam["lr"].fill_(lr * (pi_mult if o is opt_pi else 1.0))
@@ -937,6 +962,7 @@ for it in range(start_it, args.iterations):
         if GRAPH and pi_avg is not None and int(pi_avg.n_averaged) == n_avg0:
             pi_avg.n_averaged += 1  # ema_update (and a graph replay) does not advance the host-side counter
         agg["pi"].append(pl), agg["v"].append(vl), agg["ir"].append(ir), agg["gn"].append(gn), agg["surv"].append(surv)
+    agg["vel"].append(velocity_update())
     if (it + 1) % args.log_every == 0:
         mean = lambda x: float(sum(float(v) for v in x) / max(len(x), 1))  # noqa: E731
         mean_nn = lambda x: mean([v for v in (float(v) for v in x) if v == v])  # noqa: E731  (--reset_masked: NaN = no end)
@@ -947,6 +973,8 @@ for it in range(start_it, args.iterations):
         row = [it + 1, wall_h, sim_steps, mean(agg["wm"]), mean(agg["wm8"]), mean(agg["pi"]), mean(agg["v"]), mean(agg["ir"]),
                mean(agg["gn"]), mean(agg["surv"]), mean(stats["r"]), mean_nn(stats["ep_len"]), mean_nn(stats["ep_ret"]), term_frac, ips, lr]  # fmt: skip
         extra = [lr * pi_mult, float(pi_mult), int(NONFINITE)] if LOG_EXTRA else []
+        vel_rmse = mean(agg["vel"])
+        extra += [vel_rmse] if LOG_VEL else []
         log_f.write(",".join(f"{x:.6g}" if isinstance(x, float) else str(x) for x in row + extra) + "\n")
         deadline = args.lr_decay_by > 0 and it + 1 >= args.lr_decay_by
         if args.lr_decay_ret > 0 and DECAY_AT[0] is None and (row[12] >= args.lr_decay_ret or deadline):
@@ -955,7 +983,7 @@ for it in range(start_it, args.iterations):
             print(f"--lr_decay_ret: {why} at it {it + 1}: policy LR x{args.pi_lr_mult} -> x1 over {args.lr_decay_len} its", flush=True)
         log_f.flush()
         print(f"it {it + 1} | {wall_h:.3f} h | wm {row[3]:.4f} e8 {row[4]:.4f} | pi {row[5]:.3f} v {row[6]:.4f} imag_r {row[7]:.3f} surv {row[9]:.3f} "
-              f"| sim_r {row[10]:.3f} ep_len {row[11]:.1f} ep_ret {row[12]:.3f} term {term_frac:.2f} | {ips:.2f} it/s", flush=True)  # fmt: skip
+              f"| vel_rmse {vel_rmse:.4f} | sim_r {row[10]:.3f} ep_len {row[11]:.1f} ep_ret {row[12]:.3f} term {term_frac:.2f} | {ips:.2f} it/s", flush=True)  # fmt: skip
         stats = {k: [] for k in stats}
         agg = {k: [] for k in agg}
     wall = time.time() - t_start
@@ -966,7 +994,8 @@ for it in range(start_it, args.iterations):
     final_ck = it + 1 == args.iterations or out_of_time
     if args.ckpt_light and not final_ck and ((it + 1) % args.ckpt_every == 0 or timed):
         sd = pi_avg.module.state_dict() if pi_avg is not None else pi.state_dict()
-        small = {"pi": {k: v.detach().to("cpu", copy=True) for k, v in sd.items()}, "iteration": it + 1,
+        small = {"pi": {k: v.detach().to("cpu", copy=True) for k, v in sd.items()},
+                 "vel": {k: v.detach().to("cpu", copy=True) for k, v in vel.state_dict().items()}, "iteration": it + 1,
                  "wall_time": time.time() - t_start, "sim_steps": sim_steps, "args": vars(args),
                  "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}  # fmt: skip
         path = os.path.join(args.log_dir, f"ckpt_{it + 1:06d}.pt")
@@ -974,7 +1003,8 @@ for it in range(start_it, args.iterations):
         CKPT_PENDING.append(CKPT_POOL.submit(_save_atomic, small, path))
     elif (it + 1) % args.ckpt_every == 0 or it + 1 == args.iterations or timed or out_of_time:
         ck = {"wm": wm.state_dict(), "pi": pi_avg.module.state_dict() if pi_avg is not None else pi.state_dict(), "pi_live": pi.state_dict(), "critic": critic.state_dict(), "opt_wm": opt_wm.state_dict(),
-              "opt_pi": opt_pi.state_dict(), "opt_v": opt_v.state_dict(), "iteration": it + 1,
+              "opt_pi": opt_pi.state_dict(), "opt_v": opt_v.state_dict(), "vel": vel.state_dict(),
+              "opt_vel": opt_vel.state_dict(), "iteration": it + 1,
               "wall_time": time.time() - t_start, "sim_steps": sim_steps, "args": vars(args),
               "pi_avg": pi_avg.state_dict() if pi_avg is not None else None,
               "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}  # fmt: skip
@@ -985,7 +1015,7 @@ for it in range(start_it, args.iterations):
         last = os.path.join(args.log_dir, "last.pt")
         torch.save(ck, last + ".tmp")
         os.replace(last + ".tmp", last)
-        small = {k: ck[k] for k in ("pi", "pi_live", "wm", "iteration", "wall_time", "sim_steps", "args", "saved_at")}
+        small = {k: ck[k] for k in ("pi", "pi_live", "wm", "vel", "iteration", "wall_time", "sim_steps", "args", "saved_at")}
         path = os.path.join(args.log_dir, f"ckpt_{it + 1:06d}.pt")
         torch.save(small, path + ".tmp")
         os.replace(path + ".tmp", path)

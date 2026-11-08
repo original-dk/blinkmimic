@@ -248,6 +248,18 @@ class Policy(nn.Module):
         return torch.tanh(run_mlp(self.enc, self.goal_norm(goal)))
 
 
+class VelocityEstimator(nn.Module):
+    """Current body-frame linear velocity (m/s) from the actor's raw observation history."""
+
+    def __init__(self, obs_dim: int, hist: int = 10):
+        super().__init__()
+        self.obs_norm = RunningNorm(obs_dim)
+        self.net = mlp(obs_dim * hist, [256, 128], 3)
+
+    def forward(self, obs_hist: torch.Tensor) -> torch.Tensor:
+        return run_mlp(self.net, self.obs_norm(obs_hist).flatten(-2))
+
+
 # Switches of the development code that this release does not have, with their "off" value. Run arguments (args.json,
 # the "args" of a checkpoint) of that code still carry them; at the off value they are ignored, any other value
 # describes a run that this code cannot rebuild or continue.
