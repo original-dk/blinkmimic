@@ -27,6 +27,8 @@ parser.add_argument("--wm_batch", type=int, default=2048)
 parser.add_argument("--pi_batch", type=int, default=4096)
 parser.add_argument("--lr", type=float, default=2e-4)
 parser.add_argument("--vel_lr", type=float, default=2e-4, help="fixed velocity-estimator learning rate, independent of --lr")
+parser.add_argument("--vel_mix_rate", type=float, default=1e-4,
+                    help="velocity-input mixture update rate after 1000 updates: mix += rate * (1 - mix); 0 freezes it")
 parser.add_argument("--gamma", type=float, default=0.99)
 parser.add_argument("--lam", type=float, default=0.95)
 parser.add_argument("--action_noise", type=float, default=0.1)
@@ -131,6 +133,7 @@ parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--resume", type=str, default=None)
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 args = parser.parse_args()
+assert 0 <= args.vel_mix_rate <= 1, "--vel_mix_rate must be in [0, 1]"
 
 import torch
 import torch.nn as nn
@@ -425,7 +428,7 @@ def velocity_ema_update():
         avg.copy_(live)  # normalization statistics are already running estimates
     vel_steps += 1
     if vel_steps > 1000:
-        vel_mix.lerp_(torch.ones_like(vel_mix), 0.001)
+        vel_mix.lerp_(torch.ones_like(vel_mix), args.vel_mix_rate)
 
 
 def sample_valid_starts(B: int):

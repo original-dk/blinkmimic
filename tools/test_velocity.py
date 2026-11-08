@@ -212,7 +212,8 @@ class VelocityTest(unittest.TestCase):
             for p in live.parameters():
                 p.add_(1.)
             live.obs_norm.mean.fill_(3.)
-        scope = train_functions(vel=live, vel_avg=avg, vel_mix=torch.tensor(0.), vel_steps=999)
+        scope = train_functions(vel=live, vel_avg=avg, vel_mix=torch.tensor(0.), vel_steps=999,
+                                args=SimpleNamespace(vel_mix_rate=0.0001))
         scope["velocity_ema_update"]()
         self.assertEqual(scope["vel_mix"].item(), 0.)
         for old, smooth in zip(before, avg.parameters()):
@@ -220,8 +221,15 @@ class VelocityTest(unittest.TestCase):
         torch.testing.assert_close(avg.obs_norm.mean, live.obs_norm.mean)
         for _ in range(1000):
             scope["velocity_ema_update"]()
-        self.assertAlmostEqual(scope["vel_mix"].item(), 1 - 0.999 ** 1000, places=5)
+        self.assertAlmostEqual(scope["vel_mix"].item(), 1 - 0.9999 ** 1000, places=5)
         self.assertTrue(all(p.grad is None for p in live.parameters()))
+        scope["args"].vel_mix_rate = 0.
+        before_mix = scope["vel_mix"].clone()
+        scope["velocity_ema_update"]()
+        torch.testing.assert_close(scope["vel_mix"], before_mix)
+        scope["args"].vel_mix_rate = 1.
+        scope["velocity_ema_update"]()
+        self.assertEqual(scope["vel_mix"].item(), 1.)
 
     def test_wm_rollout_and_mirror(self):
         scope = self.setup_collection()
